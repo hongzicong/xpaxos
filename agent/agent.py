@@ -19,6 +19,54 @@ DEFAULT_PAPER_PATH = "/home/zicon/xpaxos/papers/epaxos.pdf"
 DEFAULT_OUTPUT_FILE = "EPaxos.v"
 DEFAULT_MODEL = "claude-opus-4-8"
 
+PROTOCOL_OVERRIDES = {
+    "EPaxos": r"""
+## EPaxos mandatory override
+
+Use the optimized EPaxos fast quorum exactly:
+
+    f + floor((f + 1) / 2)
+
+under:
+
+    n = 2 * f + 1
+
+Do not add +1. Do not use ceil. Do not claim f+1 fast-quorum intersection.
+If Recoverability cannot be proved in this simplified value-only model, document the framework mismatch instead of changing the quorum.
+""",
+
+    "SwiftPaxos": r"""
+## SwiftPaxos mandatory override
+
+Do not model SwiftPaxos as renamed Fast Paxos.
+
+The model must include a distinguished leader.
+
+Every direct fast quorum used for fast commit must include the leader.
+
+The model must distinguish at least two kinds of acknowledgements:
+
+1. ordinary acknowledgement of a proposal;
+2. leader-choice acknowledgement, meaning that the sender knows this value is the one accepted/forwarded by the leader.
+
+The model must include the leader-choice fast path:
+
+1. the leader forwards or broadcasts the first proposal it accepts;
+2. a replica receiving the leader-forwarded proposal overrides its tentative accepted value with the leader's value;
+3. the replica records that this value is the leader's accepted choice;
+4. the replica sends a distinct leader-choice acknowledgement;
+5. a proposer may fast-commit either:
+   - by receiving acknowledgements from a fast quorum that includes the leader; or
+   - by receiving f + 1 leader-choice acknowledgements.
+
+The second case is still part of the fast path, even though it goes through the leader.
+
+If modeling the fixed-quorum variant of SwiftPaxos, define one predetermined quorum of size f + 1 that includes the leader. In that case, do not also use FastPaxos-sized quorums.
+
+Do not replace the leader-choice path with a generic FastPaxos quorum-intersection proof.
+"""
+}
+
 PROMPT_TEMPLATE = r"""
 You are working in the Rocq/Coq project directory:
 
@@ -45,46 +93,18 @@ A file that uses `Admitted`, `admit`, or `Axiom` is not complete.
 
 This task is NOT to formalize the full protocol from the paper.
 
-The goal is similar in scope to `FastPaxos.v`: implement a small adopt-commit instantiation that captures the protocol's fast-path quorum idea and proves the same four high-level framework properties.
+The goal is to implement a small adopt-commit instantiation that captures the protocol's fast-path quorum idea and proves the same four high-level framework properties.
 
 Implement and prove ONLY the fast path.
 
 Do NOT model:
 
-- Accept phase
-- AcceptReply phase
 - slow path fallback
 - full recovery protocol
 - multi-instance execution
 - dependency graph execution
 - liveness
 - performance optimizations
-
-It is acceptable and expected that `__OUTPUT_FILE__` is not a complete formalization of `__PROTOCOL_NAME__`.
-
-At the top of `__OUTPUT_FILE__`, include a comment saying clearly:
-
-```coq
-(*
-  This file formalizes only a fast-path __PROTOCOL_NAME__-style
-  adopt-commit abstraction.
-
-  It is NOT a full formalization of __PROTOCOL_NAME__.
-
-  Modeled:
-  - one command/value proposed through a fast-path quorum
-  - the protocol's fast-path quorum-intersection idea
-  - adopt-commit-level Validity, Agreement, Convergence, and Recoverability
-
-  Not modeled:
-  - slow path
-  - Accept / AcceptReply
-  - recovery protocol
-  - multi-instance execution
-  - dynamic dependency graph execution
-  - liveness or performance behavior
-*)
-```
 
 ## Important project files
 
@@ -133,7 +153,7 @@ From the paper, extract only the fast-path mechanisms that matter for this abstr
 9. failure assumptions
 10. the safety property relevant to the fast path
 
-Before writing any Coq code, create a top-level design note in `__OUTPUT_FILE__` explaining how the paper's fast path is mapped into the available adopt-commit framework.
+__PROTOCOL_OVERRIDE__
 
 ## Step 3 — Read the existing Coq framework
 
@@ -173,14 +193,12 @@ Note that write the file in segments, writing every 80 lines at a time.
 
 The model should be intentionally simple:
 
-- message type similar to `FastPaxos.v`, but protocol-specific
-- local state similar to `FastPaxos.v`, but protocol-specific
 - one accepted command/value per process
 - a list of fast-path acknowledgments or acceptors
-- output is `Some (Commit v)` only when a fast quorum is reached
+- output is `Some (Commit v)` only when the protocol-specific fast-commit condition is met:
+  - for protocols with a single fast quorum path, this means a fast quorum is reached;
+  - for SwiftPaxos, this may also mean receiving f + 1 leader-choice acknowledgements.
 - no `Adopt`
-- no `Accept`
-- no `AcceptReply`
 - no slow-path state
 - no slow-path messages
 
@@ -198,8 +216,6 @@ Output stability: the framework does NOT enforce that a process's output is stab
 
 ## Step 5 — Fast quorum
 
-Derive the fast quorum size from the paper.
-
 Do not invent quorum formulas.
 
 Do not implement separate slow quorum, classic quorum, or Accept quorum.
@@ -214,11 +230,13 @@ or an equivalent lemma sufficient to prove Agreement.
 
 Be careful with integer division and ceiling/floor behavior.
 
-If the paper uses a ceiling-style expression, encode it explicitly or use a stronger integer formula with a comment explaining the relationship.
+If the paper uses a ceiling/floor-style expression, encode it explicitly or use a stronger integer formula with a comment explaining the relationship.
 
 Use helper lemmas and arithmetic tactics as in `FastPaxos.v`, including `lia`, `Nat.div_mod`, and `Nat.mod_upper_bound` if needed.
 
-The framework provides only `f_lt_n : f < n` as its base hypothesis. The comment in `AdoptCommit.v` notes that liveness would require `2 * f < n`, but safety proofs only have `f_lt_n` available by default. If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption (e.g., `n = 2 * f + 1` for EPaxos and SwiftPaxos), add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
+The framework provides only `f_lt_n : f < n` as its base hypothesis. The comment in `AdoptCommit.v` notes that liveness would require `2 * f < n`, but safety proofs only have `f_lt_n` available by default. 
+
+If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption (e.g., `n = 2 * f + 1` and `0 < f` for EPaxos and SwiftPaxos), add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
 
 If extra assumptions on `n` and `f` are required, state them explicitly and justify them in comments.
 
@@ -314,17 +332,14 @@ Remember: the goal is not only to pass `make`; the goal is to build a small, hon
 
 
 def build_prompt(project_dir: str, protocol_name: str, paper_path: str, output_file: str) -> str:
-    """Build the agent prompt without using str.format.
-
-    We intentionally use string replacement instead of str.format so that Coq,
-    Markdown, and shell snippets containing braces cannot break prompt rendering.
-    """
+    override = PROTOCOL_OVERRIDES.get(protocol_name, "")
     return (
         PROMPT_TEMPLATE
         .replace("__PROJECT_DIR__", project_dir)
         .replace("__PROTOCOL_NAME__", protocol_name)
         .replace("__PAPER_PATH__", paper_path)
         .replace("__OUTPUT_FILE__", output_file)
+        .replace("__PROTOCOL_OVERRIDE__", override)
     )
 
 
