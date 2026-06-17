@@ -214,33 +214,34 @@ Do not simply rename an existing implementation. You may reuse proof structure a
 
 Output stability: the framework does NOT enforce that a process's output is stable once set (this is a known limitation noted in `AdoptCommit.v`). You must design `acp_step_fn` so that once a process reaches a commit state, its local state never transitions to produce a different output. The standard pattern is to make the commit state absorbing: any message received in that state leaves the local state unchanged.
 
-## Step 5 — Fast quorum
+## Step 5 — Protocol-specific fast-path safety
 
 Do not invent quorum formulas.
 
-Do not implement separate slow quorum, classic quorum, or Accept quorum.
+Do not implement separate slow quorum, classic quorum, Accept quorum, or recovery quorum unless the protocol-specific override explicitly asks for it.
 
-For this fast-path-only abstraction, the main required property is quorum intersection, for example:
+Do not assume that every protocol's fast-path safety proof has the same structure as FastPaxos.
 
-```coq
-n < 2 * fast_quorum
-```
+Before writing proofs, identify the protocol-specific fast-commit conditions that were modeled in Step 4, and state in comments which safety obligations are needed for the framework properties.
 
-or an equivalent lemma sufficient to prove Agreement.
+Use the protocol paper and the protocol-specific override as the source of truth for:
 
-Be careful with integer division and ceiling/floor behavior.
+* quorum size
+* quorum membership requirements
+* fast-commit conditions
+* message or acknowledgement types
+* special process roles, such as leaders or command leaders
+* any protocol-specific metadata needed for the fast path
 
-If the paper uses a ceiling/floor-style expression, encode it explicitly or use a stronger integer formula with a comment explaining the relationship.
+If the protocol uses a ceiling/floor-style quorum expression, encode it explicitly and be careful with integer division behavior.
 
-Use helper lemmas and arithmetic tactics as in `FastPaxos.v`, including `lia`, `Nat.div_mod`, and `Nat.mod_upper_bound` if needed.
+The framework provides only `f_lt_n : f < n` as its base hypothesis. The comment in `AdoptCommit.v` notes that liveness would require `2 * f < n`, but safety proofs only have `f_lt_n` available by default.
 
-The framework provides only `f_lt_n : f < n` as its base hypothesis. The comment in `AdoptCommit.v` notes that liveness would require `2 * f < n`, but safety proofs only have `f_lt_n` available by default. 
-
-If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption (e.g., `n = 2 * f + 1` and `0 < f` for EPaxos and SwiftPaxos), add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
+If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption, for example `n = 2 * f + 1` and `0 < f`, add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
 
 If extra assumptions on `n` and `f` are required, state them explicitly and justify them in comments.
 
-Do not silently add arbitrary assumptions merely to make proofs pass.
+If the current adopt-commit framework cannot express some protocol-specific metadata or proof obligation, document the mismatch clearly instead of changing the protocol.
 
 ## Step 6 — Prove the four framework properties
 
