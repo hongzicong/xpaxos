@@ -23,16 +23,42 @@ PROTOCOL_OVERRIDES = {
     "EPaxos": r"""
 ## EPaxos mandatory override
 
-Use the optimized EPaxos fast quorum exactly:
+The fast quorum size in EPaxos is `f + floor((f + 1) / 2)` under `n = 2 * f + 1`. Do not add +1, use ceil, or change the quorum size.
 
-    f + floor((f + 1) / 2)
+In this adopt-commit abstraction, values are ProcessIds. Treat value v as the command whose command leader is process v.
 
-under:
+Unlike FastPaxos, only command leader v may output Commit v; other replicas may only pre-accept v and acknowledge it. Prove:
 
-    n = 2 * f + 1
+    ep_output (local s p) = Some (Commit v) -> p = v
 
-Do not add +1. Do not use ceil. Do not claim f+1 fast-quorum intersection.
-If Recoverability cannot be proved in this simplified value-only model, document the framework mismatch instead of changing the quorum.
+For EPaxos Recoverability, absolutely do not follow the Recoverability proof strategy in `FastPaxos.v`; that fast-quorum/live-quorum intersection argument is false for the optimized quorum.
+
+In particular, DO NOT define
+
+    B := Aw ∩ alive
+
+and DO NOT try to prove
+
+    Av ∩ B ≠ ∅
+    or
+    n < |Av| + |B|
+
+This is exactly the wrong FastPaxos-style proof route and is false for the EPaxos optimized quorum.
+
+Instead count non-alive nodes: if different values v and w are committed in two reachable states equal on alive replicas, then leaders v and w and every node in the intersection of the two commit certificates Av ∩ Aw must be non-alive. These sets are disjoint, so non-alive nodes are at least:
+
+    2 + (2 * ep_quorum - n)
+
+With `n = 2 * f + 1` and `ep_quorum = f + floor((f + 1) / 2)`, this is `2 * floor((f + 1) / 2) + 1 > f`, contradicting that at most f nodes are non-alive.
+
+When implementing Recoverability, first prove helper lemmas for:
+1. all replicas in Av ∩ Aw are non-alive;
+2. leader v is non-alive;
+3. leader w is non-alive;
+4. these three groups are disjoint;
+5. together they imply more than f non-alive nodes.
+
+Do not attempt to repair any proof obligation of the form `n < length Av + length (Aw ∩ alive)`; delete that route instead.
 """,
 
     "SwiftPaxos": r"""
@@ -68,7 +94,7 @@ Do not replace the leader-choice path with a generic FastPaxos quorum-intersecti
 }
 
 PROMPT_TEMPLATE = r"""
-You are working in the Rocq/Coq project directory:
+You are working in the Rocq project directory:
 
 `__PROJECT_DIR__`
 
@@ -84,10 +110,11 @@ The target output file is:
 
 `__OUTPUT_FILE__`
 
-Correctness of the formal model matters more than merely making `make` succeed.
+`make` success is a hard requirement for this task.
 
 A compiling file that is just a renamed copy of an existing implementation is not acceptable.
-A file that uses `Admitted`, `admit`, or `Axiom` is not complete.
+
+Work autonomously. Do not ask for user input, confirmation, or preference at any point. If you face a decision, choose the path most likely to produce a compilable, Admitted-free proof.
 
 ## Scope
 
@@ -97,157 +124,58 @@ The goal is to implement a small adopt-commit instantiation that captures the pr
 
 Implement and prove ONLY the fast path.
 
-Do NOT model:
-
-- slow path fallback
-- full recovery protocol
-- multi-instance execution
-- dependency graph execution
-- liveness
-- performance optimizations
-
 ## Important project files
 
 The project directory contains:
 
 - `AdoptCommit.v`: this file models the adopt-commit abstraction and the arbitrary executions allowed by asynchronous networks. It defines `ACProtocol`, `Reachable`, and high-level properties such as Validity, Agreement, Convergence, and Recoverability.
-- `FastPaxos.v`: this file instantiates the adopt-commit model with the fast path of FastPaxos and proves its safety and recoverability. Use it as the main proof-structure reference for this task.
+- `FastPaxos.v`: this file instantiates the adopt-commit model with the fast path of FastPaxos and proves its Validity, Agreement, Convergence, and Recoverability.
 - `Makefile`: builds the project using `rocq compile`.
 
-Network model (from `AdoptCommit.v`): messages between each (src, dst) pair are delivered in FIFO order and are never duplicated or reordered. Message loss is modeled as non-delivery — the `step` relation is a no-op when the queue is empty. Do NOT add duplication, reordering, or replay logic to `acp_step_fn`.
+# Phase 1 — Read
 
-Type convention (from `AdoptCommit.v`): `ProcessId := nat` serves as both process identifier and proposed value. Each proposer proposes its own ID. Do not introduce a separate value type — doing so will be incompatible with the framework's `ACOutput` and property definitions.
+## Step 1 — Read the existing Coq framework
 
-Your new file `__OUTPUT_FILE__` should follow the same level of abstraction as `FastPaxos.v`: it should model only the fast path of `__PROTOCOL_NAME__` within the adopt-commit framework, rather than the full protocol.
+Read `AdoptCommit.v`, `FastPaxos.v`, and `Makefile`.
 
-## Step 1 — Enter the project directory
+The goal is to understand what the framework expects from an instantiation — what types to define, what the `step` function must express, and how the four high-level properties are stated.
 
-Run:
-
-```bash
-cd __PROJECT_DIR__
-pwd
-ls -lh
-```
+Use `FastPaxos.v` as an interface and proof-style reference, not as a protocol-specific proof template.
 
 ## Step 2 — Read the protocol paper
 
-Read the protocol paper directly using the `Read` tool:
+Read the protocol paper at `__PAPER_PATH__`.
 
-`__PAPER_PATH__`
-
-Use the paper only to identify the protocol's fast-path quorum intuition and fast-path decision rule.
-
-Do not attempt to model the whole protocol.
-
-From the paper, extract only the fast-path mechanisms that matter for this abstraction:
-
-1. system model
-2. replicas or processes
-3. proposers or command leaders, if any
-4. proposed values or commands
-5. fast-path message pattern
-6. fast-path commit or decision condition
-7. fast quorum size
-8. quorum-intersection requirement
-9. failure assumptions
-10. the safety property relevant to the fast path
+The goal is to understand `__PROTOCOL_NAME__`'s fast-path commit condition clearly enough to translate it into a `step` function and commit certificate type, and to identify where it differs from FastPaxos.
 
 __PROTOCOL_OVERRIDE__
 
-## Step 3 — Read the existing Coq framework
+# Phase 2 — Think
 
-Read:
+## Step 3 — Analyze protocol-specific properties
 
-```bash
-AdoptCommit.v
-FastPaxos.v
-Makefile
-```
+Identify every place where `__PROTOCOL_NAME__`'s fast path differs from FastPaxos — each difference means a different type, a different lemma, or a different proof strategy.
 
-Use `FastPaxos.v` as the main proof-structure template.
+Create `__PROJECT_DIR__/__OUTPUT_FILE__` containing only a comment block that records the analysis. Do not write any Rocq definitions or theorems yet.
 
-Determine:
-
-1. What `ACProtocol` allows a protocol to define.
-2. What the global and local states look like.
-3. What the step function can express.
-4. What the existing properties mean:
-   - Validity
-   - Agreement
-   - Convergence
-   - Recoverability
-5. How `FastPaxos.v` proves these four properties.
-
-The new `__OUTPUT_FILE__` should have a similar level of abstraction to `FastPaxos.v`.
+# Phase 3 — Implement
 
 ## Step 4 — Implement a fast-path-only abstraction
 
-Write:
-
-```bash
-__PROJECT_DIR__/__OUTPUT_FILE__
-```
-
-Note that write the file in segments, writing every 80 lines at a time.
-
-The model should be intentionally simple:
-
-- one accepted command/value per process
-- a list of fast-path acknowledgments or acceptors
-- output is `Some (Commit v)` only when the protocol-specific fast-commit condition is met:
-  - for protocols with a single fast quorum path, this means a fast quorum is reached;
-  - for SwiftPaxos, this may also mean receiving f + 1 leader-choice acknowledgements.
-- no `Adopt`
-- no slow-path state
-- no slow-path messages
-
-You may include simplified protocol-specific metadata, such as dependencies or sequence numbers, only if they do not make the proof significantly more complex.
-
-Important:
-If the current `ACOutput` type cannot express metadata such as attributes, dependencies, sequence numbers, or execution order, do not claim to prove metadata agreement.
-Instead, state clearly that this adopt-commit abstraction proves agreement only on the committed value.
+Expand the comment-only file created in Step 3 into a skeleton with type and definition declarations. Use Edit calls (~80 lines each) to add content incrementally.
 
 Use names prefixed by `__PROTOCOL_NAME__` or a suitable lowercase abbreviation.
 
-Do not simply rename an existing implementation. You may reuse proof structure and lemma ideas from `FastPaxos.v`, but the top comment must explain the protocol-specific fast-path mapping.
+Add `__OUTPUT_FILE__` to the `Makefile` immediately after the existing protocol files:
 
-Output stability: the framework does NOT enforce that a process's output is stable once set (this is a known limitation noted in `AdoptCommit.v`). You must design `acp_step_fn` so that once a process reaches a commit state, its local state never transitions to produce a different output. The standard pattern is to make the commit state absorbing: any message received in that state leaves the local state unchanged.
+```make
+$(ROCQC) __OUTPUT_FILE__
+```
 
-## Step 5 — Protocol-specific fast-path safety
+## Step 5 — Prove the four properties
 
-Do not invent quorum formulas.
-
-Do not implement separate slow quorum, classic quorum, Accept quorum, or recovery quorum unless the protocol-specific override explicitly asks for it.
-
-Do not assume that every protocol's fast-path safety proof has the same structure as FastPaxos.
-
-Before writing proofs, identify the protocol-specific fast-commit conditions that were modeled in Step 4, and state in comments which safety obligations are needed for the framework properties.
-
-Use the protocol paper and the protocol-specific override as the source of truth for:
-
-* quorum size
-* quorum membership requirements
-* fast-commit conditions
-* message or acknowledgement types
-* special process roles, such as leaders or command leaders
-* any protocol-specific metadata needed for the fast path
-
-If the protocol uses a ceiling/floor-style quorum expression, encode it explicitly and be careful with integer division behavior.
-
-The framework provides only `f_lt_n : f < n` as its base hypothesis. The comment in `AdoptCommit.v` notes that liveness would require `2 * f < n`, but safety proofs only have `f_lt_n` available by default.
-
-If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption, for example `n = 2 * f + 1` and `0 < f`, add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
-
-If extra assumptions on `n` and `f` are required, state them explicitly and justify them in comments.
-
-If the current adopt-commit framework cannot express some protocol-specific metadata or proof obligation, document the mismatch clearly instead of changing the protocol.
-
-## Step 6 — Prove the four framework properties
-
-Prove the same four theorem names, adapted to `__PROTOCOL_NAME__`:
-
-```coq
+Prove the four properties incrementally. Write exactly one new lemma or theorem per edit. Do not append multiple helper lemmas and a theorem in one large edit. After each new lemma or theorem, run `make` before adding the next one.
+```
 __PROTOCOL_NAME___Validity
 __PROTOCOL_NAME___Agreement
 __PROTOCOL_NAME___Convergence
@@ -259,62 +187,23 @@ These theorems should be interpreted at the adopt-commit abstraction level.
 Important:
 
 - `__PROTOCOL_NAME___Validity` should show that every output value (Commit or Adopt) was proposed by a valid proposer.
-- `__PROTOCOL_NAME___Agreement` should show that if any process commits v, then every process that produces any output (Commit OR Adopt) must output v. This is stronger than "two commits agree" — it constrains Adopt outputs as well.
+- `__PROTOCOL_NAME___Agreement` should show that if any process commits v, then every process that produces any output (Commit OR Adopt) must output v.
 - `__PROTOCOL_NAME___Convergence` should use the uniqueness of valid proposer values as in the framework: with a unique proposer, every terminating process must Commit (Adopt is not acceptable).
-- `__PROTOCOL_NAME___Recoverability` captures the precise property defined in `AdoptCommit.v`: for any two reachable states s and s' that agree on the local states of at least n-f processes, if s has a Commit of v and s' has a Commit of w, then v = w. Intuitively, this means the fast-path quorum must be large enough that any n-f survivors retain enough evidence to rule out a conflicting commit — which is what makes safe adoption possible in any subsequent recovery phase.
-- If Recoverability cannot be proved with the chosen assumptions, strengthen and document the assumptions explicitly, but do not silently add arbitrary assumptions.
+- `__PROTOCOL_NAME___Recoverability` captures the precise property defined in `AdoptCommit.v`: for any two reachable states `s` and `s'` that agree on the local states of at least `n - f` processes, if `s` has a `Commit v` and `s'` has a `Commit w`, then `v = w`.
 
-## Step 7 — Absolutely no admitted proofs
+The framework provides only `f_lt_n : f < n` as its base hypothesis. If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption, for example `n = 2 * f + 1` and `0 < f`, add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
 
-Do not use any of the following under any circumstance:
-
-```coq
-Admitted.
-admit.
-Axiom
-```
-
-If a theorem cannot be proved in the current framework, do not state it with `Admitted`.
-Instead, either:
-1. fix the model and supporting lemmas until the theorem is provable, or
-2. replace the theorem with a clearly documented comment explaining why the current framework is insufficient.
-
-After editing, run:
+After all four properties are proved, run a final `make` and verify:
 
 ```bash
-grep -RInE '\bAdmitted\b|\badmit\b|\bAxiom\b' __OUTPUT_FILE__
+grep -rn "Admitted\|admit\b\|^Axiom" __OUTPUT_FILE__
 ```
 
-If this command prints anything, the task is not complete.
+The grep must print nothing. Do not hide proof failures by weakening the model without justification.
 
-## Step 8 — Update the Makefile and compile
+# Phase 4 — Summary
 
-Add `__OUTPUT_FILE__` to the `Makefile` after the existing protocol files.
-
-For example:
-
-```make
-$(ROCQC) __OUTPUT_FILE__
-```
-
-Then run:
-
-```bash
-make
-```
-
-If compilation fails:
-
-1. Read the error carefully.
-2. Fix the actual code or proof error.
-3. Run `make` again.
-4. Repeat until both conditions hold:
-   - `make` succeeds
-   - the grep command for `Admitted`, `admit`, and `Axiom` prints nothing
-
-Do not hide proof failures by weakening the model without justification.
-
-## Step 9 — Final audit report
+## Step 6 — Final audit report
 
 After success, print a concise final report containing:
 
@@ -326,8 +215,6 @@ After success, print a concise final report containing:
 6. confirmation that no `Admitted`, `admit`, or `Axiom` remains
 7. the final list of changed files
 8. a clear statement that this is not a full formalization of `__PROTOCOL_NAME__`
-
-Remember: the goal is not only to pass `make`; the goal is to build a small, honest, fast-path-only, paper-grounded adopt-commit model similar in scope to `FastPaxos.v`.
 """
 
 
@@ -579,12 +466,12 @@ def print_message(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a Claude Agent SDK workflow to implement a paper-grounded Rocq/Coq consensus protocol model."
+        description="Run a Claude Agent SDK workflow to implement a paper-grounded Rocq consensus protocol model."
     )
     parser.add_argument(
         "--project-dir",
         default=DEFAULT_PROJECT_DIR,
-        help=f"Rocq/Coq project directory. Default: {DEFAULT_PROJECT_DIR}",
+        help=f"Rocq project directory. Default: {DEFAULT_PROJECT_DIR}",
     )
     parser.add_argument(
         "--protocol",
@@ -630,6 +517,7 @@ async def main() -> None:
         cwd=args.project_dir,
         allowed_tools=["Read", "Write", "Edit", "Bash"],
         permission_mode="acceptEdits",
+        effort="xhigh",
         model=args.model,
     )
 
