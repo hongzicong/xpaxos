@@ -1,72 +1,98 @@
-(** * Adopt-Commit emulating SwiftPaxos's Fast-Path
-    This file instantiates the abstract adopt-commit framework from
-    AdoptCommit.v with a simplified fast path inspired by SwiftPaxos.
+(** * SwiftPaxos fast-path adopt-commit analysis
 
-    SwiftPaxos (USENIX NSDI 2021) is a leaderless consensus protocol
-    designed for geo-distributed systems with low tail latency.
+    Scope.  This file will model one command/value in one stable ballot.  It
+    deliberately omits dependency graphs, execution, the ordinary Paxos slow
+    quorum, ballot changes, and recovery.  The paper's FastAck/SlowAck names
+    are represented here as ordinary and leader-choice acknowledgements.
 
-    This file formalizes only a fast-path SwiftPaxos-style
-    adopt-commit abstraction.
+    Differences from FastPaxos.v:
+    - SwiftPaxos has a distinguished leader and every direct fast quorum
+      contains it.  Agreement should therefore use the leader's immutable
+      first accepted value, rather than only a generic quorum-intersection
+      argument.
+    - There are two explicit direct-quorum configurations.  C1 accepts any
+      duplicate-free valid set containing the leader with
+      [4 * length Q > 3 * n].  C2 accepts only one predetermined,
+      duplicate-free valid quorum of size [f + 1] containing the leader.
+    - A replica may replace its tentative ordinary vote after receiving the
+      leader's forwarded value.  Thus tentative acceptance is not globally
+      stable as it is in FastPaxos.
+    - Acknowledgements have two distinct meanings: an ordinary vote and a
+      leader-choice vote.  The latter records knowledge that the value came
+      from the leader.
+    - A commit certificate is disjunctive: either ordinary acknowledgements
+      cover a direct C1/C2 quorum, or [f + 1] distinct leader-choice
+      acknowledgements have been collected.
 
-    It is NOT a full formalization of SwiftPaxos.
+    Differences from EPaxos.v:
+    - The leader is fixed for the modeled ballot rather than being the
+      proposer/owner of each command.
+    - Commit is not restricted to the value's proposer process.
+    - The proof does not rely on EPaxos's proposer-specific quorum
+      intersection.  Direct agreement is anchored by the leader member, and
+      leader-choice acknowledgements are anchored by knowledge of that same
+      leader value.
 
-    Modeled:
-    - one command/value proposed through a fast-path quorum
-    - the protocol's fast-path quorum-intersection idea
-    - adopt-commit-level Validity, Agreement, Convergence, and Recoverability
+    State/evidence plan:
+    - Local state records a tentative/current accepted value, optional
+      knowledge of the leader's choice, persistent histories of ordinary and
+      leader-choice acknowledgements sent, the two received certificate
+      lists, and an optional output.
+    - The leader accepts the first proposal it processes, records it as its
+      immutable choice, sends an ordinary acknowledgement, and forwards the
+      choice to all replicas.
+    - A nonleader may ordinarily acknowledge its tentative value.  On a
+      leader-forward message it overrides that tentative value, records the
+      leader choice, and sends a distinct leader-choice acknowledgement.
+    - Persistent sent-ack histories are required by Recoverability: equal
+      survivor local states must expose the evidence used by certificates
+      even after a tentative value was overridden.
 
-    Not modeled:
-    - slow path
-    - Accept / AcceptReply
-    - recovery protocol
-    - multi-instance execution
-    - dynamic dependency graph execution
-    - liveness or performance behavior
+    Arithmetic/model assumptions justified by Section 2 of the paper:
+    [n = 2*f+1] and [0 < f].  The fixed C2 quorum has exactly [f+1]
+    members.  Small cases to audit before counting lemmas are:
+      f=1, n=3: C1 minimum 3; C2/leader-choice size 2.
+      f=2, n=5: C1 minimum 4; C2/leader-choice size 3.
+      f=3, n=7: C1 minimum 6; C2/leader-choice size 4.
+      f=4, n=9: C1 minimum 7; C2/leader-choice size 5.
+    These checks show every certificate has more than [f] members.  For C1,
+    two direct quorums have intersection larger than [f] in these cases;
+    for C2, both direct certificates use the same fixed quorum.  These facts
+    are intended for cross-state Recoverability only, while same-state
+    Agreement is based on the SwiftPaxos leader facts above.
+*)
 
-    Fast path overview:
-    - Each proposer p broadcasts its proposal to all other processes.
-      This broadcast is part of the initial state rather than a step.
-      A proposer also pre-accepts its own value.
-    - When a process receives a proposal and has not yet accepted any value,
-      it accepts the proposer's value and replies to the proposer.
-    - When a process has already accepted value v and receives an acceptance
-      acknowledgment, it records sender as a new acceptor of v and commits
-      once a fast quorum is reached.
-    - Messages about a proposer other than the one already accepted are ignored.
-
-    Mapping to adopt-commit framework:
-    - ProcessId serves as both process identifier and proposed value
-    - Each proposer proposes its own ID
-    - Output is Commit v when fast quorum is reached
-    - No Adopt is produced (fast-path only)
-    - Fast quorum size ensures intersection for Agreement
-    - Recoverability requires n-f survivors to retain commit evidence *)
-
-From Stdlib Require Import List Arith Bool Classical Lia.
+From Stdlib Require Import List Arith Bool Classical ClassicalDescription Lia.
 Import ListNotations.
 
 Require Import AdoptCommit.
 
 (* ================================================================
-   Messages and Local State
+   Messages, certificates, and local state
    ================================================================ *)
 
-(** Messages encode both a proposer's request to accept and
-    the acknowledgment that a process accepted. *)
-Record SPMsg := mkSPMsg {
-  sp_source   : ProcessId; (* sender of the message *)
-  sp_proposer : ProcessId; (* Value (=proposer) the source accepted *)
-}.
+Inductive SPConfig :=
+  | C1
+  | C2.
+
+Inductive SPAckKind :=
+  | OrdinaryAck
+  | LeaderChoiceAck.
+
+Inductive SPMsg :=
+  | SPProposal : ProcessId -> SPMsg
+  | SPLeaderForward : ProcessId -> SPMsg
+  | SPAck : ProcessId -> ProcessId -> SPAckKind -> SPMsg.
 
 Record SPState := mkSPState {
-  sp_accepted  : option ProcessId;   (* Value (=proposer) that p accepted *)
-  sp_acceptors : list ProcessId;     (* processes that acknowledged accepting *)
-  sp_output    : option ACOutput;
+  sp_accepted      : option ProcessId;
+  sp_leader_choice : option ProcessId;
+  sp_sent_ordinary : option ProcessId;
+  sp_sent_leader   : option ProcessId;
+  sp_ordinary_acks : list ProcessId;
+  sp_leader_acks   : list ProcessId;
+  sp_output        : option ACOutput;
 }.
-
-(* ================================================================
-   Protocol Instantiation
-   ================================================================ *)
 
 Section SP.
 
@@ -75,825 +101,1312 @@ Hypothesis n_pos : 0 < n.
 Variable f : nat.
 Hypothesis f_lt_n : f < n.
 
-(** SwiftPaxos assumes n = 2f + 1 for the fast path.
-    This is the standard assumption for EPaxos-style protocols. *)
-Hypothesis n_eq_2f_plus_1 : n = 2 * f + 1.
+(** SwiftPaxos Section 2 assumes [N = 2f+1].  Positive [f] excludes
+    the degenerate one-replica case from the quorum arithmetic. *)
+Hypothesis sp_n_eq : n = 2 * f + 1.
+Hypothesis sp_f_pos : 0 < f.
+
+Variable leader : ProcessId.
+Hypothesis sp_leader_valid : leader < n.
 
 Variable is_proposer : ProcessId -> Prop.
 Hypothesis exists_proposer : exists p, p < n /\ is_proposer p.
+(** Process identifiers stand for command proposers in this abstraction;
+    the distinguished replica leader is not itself a command proposer. *)
+Hypothesis sp_leader_not_proposer : ~ is_proposer leader.
 
-(** Fast quorum size for SwiftPaxos.
-    Based on the paper, we need fast quorums to intersect in at least
-    one process. For n = 2f + 1, the fast quorum size is f + (f+1)/2 + 1.
+Variable config : SPConfig.
+Variable c2_quorum : list ProcessId.
+Hypothesis sp_c2_nodup : NoDup c2_quorum.
+Hypothesis sp_c2_valid :
+  forall p, In p c2_quorum -> p < n.
+Hypothesis sp_c2_size : length c2_quorum = f + 1.
+Hypothesis sp_c2_has_leader : In leader c2_quorum.
 
-    With n = 2f + 1:
-    - We need: for any two fast quorums Q1 and Q2, |Q1 ∩ Q2| >= 1
-    - This requires: 2 * sp_quorum > n
-    - With sp_quorum = f + (f+1)/2 + 1, we get:
-      2 * (f + (f+1)/2 + 1) = 2f + (f+1) + 2 >= 2f + f + 2 = 3f + 2 > 2f + 1 = n
+Definition sp_C1_fast_quorum (Q : list ProcessId) : Prop :=
+  NoDup Q /\
+  (forall p, In p Q -> p < n) /\
+  In leader Q /\
+  3 * n < 4 * length Q.
 
-    This formula ensures quorum intersection. *)
-Definition sp_quorum : nat := f + (f + 1) / 2 + 1.
+Definition sp_C2_fast_quorum (Q : list ProcessId) : Prop :=
+  Q = c2_quorum.
 
-(** Local transition function.
-    When process p receives a message (sender, proposer):
-    - If already decided, the message is ignored (output stable).
-    - If p has not accepted any value yet, p accepts the value and
-      acknowledges the acceptance to the proposer.
-    - If p already accepted value v:
-        - if the message is also about v: record sender as a new acceptor;
-          commit if sp_quorum acceptors have been collected.
-        - if the message is not about v, ignore. *)
+Definition sp_direct_fast_quorum (Q : list ProcessId) : Prop :=
+  match config with
+  | C1 => sp_C1_fast_quorum Q
+  | C2 => sp_C2_fast_quorum Q
+  end.
+
+Definition sp_leader_certificate (Q : list ProcessId) : Prop :=
+  NoDup Q /\
+  (forall p, In p Q -> p < n) /\
+  f + 1 <= length Q.
+
+Definition sp_direct_certificate (A : list ProcessId) : Prop :=
+  exists Q,
+    sp_direct_fast_quorum Q /\
+    incl Q A.
+
+Definition sp_add (p : ProcessId) (xs : list ProcessId) : list ProcessId :=
+  if existsb (Nat.eqb p) xs then xs else p :: xs.
+
+Definition sp_record_choice
+    (v : ProcessId) (old : option ProcessId) : option ProcessId :=
+  match old with
+  | Some w => Some w
+  | None => Some v
+  end.
+
+Definition sp_maybe_commit (ls : SPState) : option ACOutput :=
+  match sp_accepted ls with
+  | None => None
+  | Some v =>
+      if excluded_middle_informative
+           (is_proposer v /\
+            sp_leader_choice ls = Some v /\
+            (sp_direct_certificate (sp_ordinary_acks ls) \/
+             sp_leader_certificate (sp_leader_acks ls)))
+      then Some (Commit v)
+      else None
+  end.
+
 Definition sp_step_fn
     (p : ProcessId) (ls : SPState) (m : SPMsg)
     : SPState * (ProcessId -> list SPMsg) :=
   match sp_output ls with
   | Some _ => (ls, fun _ => [])
-  | None => match sp_accepted ls with
-      | None =>
-          (mkSPState (Some (sp_proposer m)) [] None,
-            fun dst => if Nat.eqb dst (sp_proposer m) then [mkSPMsg p (sp_proposer m)] else [])
-      | Some v =>
-          if Nat.eqb (sp_proposer m) v then
-            let new_acceptors :=
-              if existsb (Nat.eqb (sp_source m)) (sp_acceptors ls)
-              then sp_acceptors ls
-              else (sp_source m) :: sp_acceptors ls
-            in
-            let new_output :=
-              if sp_quorum <=? List.length new_acceptors then Some (Commit v)
-              else None
-            in
-            (mkSPState (Some v) new_acceptors new_output, fun _ => [])
+  | None =>
+      match m with
+      | SPProposal v =>
+          if Nat.eqb p leader then
+            match sp_leader_choice ls with
+            | Some _ => (ls, fun _ => [])
+            | None =>
+                let ls' :=
+                  mkSPState (Some v) (Some v)
+                    (sp_record_choice v (sp_sent_ordinary ls))
+                    (sp_sent_leader ls)
+                    [] [] None in
+                (ls',
+                 fun dst =>
+                   if Nat.eqb dst v
+                   then [SPAck leader v OrdinaryAck; SPLeaderForward v]
+                   else [SPLeaderForward v])
+            end
           else
-            (ls, fun _ => [])
+            match sp_accepted ls with
+            | Some _ => (ls, fun _ => [])
+            | None =>
+                (mkSPState (Some v) (sp_leader_choice ls)
+                   (sp_record_choice v (sp_sent_ordinary ls))
+                   (sp_sent_leader ls)
+                   [] [] None,
+                 fun dst =>
+                   if Nat.eqb dst v
+                   then [SPAck p v OrdinaryAck]
+                   else [])
+            end
+      | SPLeaderForward v =>
+          if Nat.eqb p leader then (ls, fun _ => [])
+          else
+            match sp_leader_choice ls with
+            | Some _ => (ls, fun _ => [])
+            | None =>
+                let base :=
+                  mkSPState (Some v) (Some v)
+                    (sp_sent_ordinary ls)
+                    (sp_record_choice v (sp_sent_leader ls))
+                    [] [] None in
+                (base,
+                 fun dst =>
+                   if Nat.eqb dst v
+                   then [SPAck p v LeaderChoiceAck]
+                   else [])
+            end
+      | SPAck src v kind =>
+          match sp_accepted ls with
+          | Some w =>
+              if Nat.eqb v w then
+                let base :=
+                  match kind with
+                  | OrdinaryAck =>
+                      mkSPState (Some w)
+                        (if Nat.eqb src leader
+                         then sp_record_choice w (sp_leader_choice ls)
+                         else sp_leader_choice ls)
+                        (sp_sent_ordinary ls) (sp_sent_leader ls)
+                        (sp_add src (sp_ordinary_acks ls))
+                        (sp_leader_acks ls) None
+                  | LeaderChoiceAck =>
+                      mkSPState (Some w)
+                        (sp_record_choice w (sp_leader_choice ls))
+                        (sp_sent_ordinary ls) (sp_sent_leader ls)
+                        (sp_ordinary_acks ls)
+                        (sp_add src (sp_leader_acks ls)) None
+                  end in
+                (mkSPState (sp_accepted base) (sp_leader_choice base)
+                   (sp_sent_ordinary base) (sp_sent_leader base)
+                   (sp_ordinary_acks base) (sp_leader_acks base)
+                   (sp_maybe_commit base),
+                 fun _ => [])
+              else (ls, fun _ => [])
+          | None => (ls, fun _ => [])
+          end
       end
   end.
 
-(** Initial state predicate.
-    - All processes start undecided.
-    - Each proposer p has accepted its own value and lists itself as the
-      sole acceptor.
-    - Non-proposers start with no accepted value and no acceptors.
-    - Each proposer has broadcasted its proposal to everyone.
-    - Non-proposers have no outgoing messages. *)
 Definition sp_init (s : GlobalState SPMsg SPState) : Prop :=
-  ((forall p,
-      sp_output (local s p) = None) /\
-  ((forall p, p < n -> is_proposer p ->
-      sp_accepted  (local s p) = Some p) /\
-  (forall p, p < n -> ~ is_proposer p ->
-      sp_accepted  (local s p) = None)) /\
-  ((forall p, p < n -> is_proposer p ->
-      sp_acceptors (local s p) = [p]) /\
-  (forall p, p < n -> ~ is_proposer p ->
-      sp_acceptors (local s p) = []))) /\
-  (((forall p q, p < n -> q < n -> p <> q -> is_proposer p ->
-      network s p q = [mkSPMsg p p]) /\
-  (forall p q, p < n -> q < n -> ~ is_proposer p ->
-      network s p q = [])) /\
-  (forall p, p < n -> network s p p = [])).
+  (forall p, sp_output (local s p) = None) /\
+  (forall p, sp_leader_choice (local s p) = None) /\
+  (forall p,
+      if excluded_middle_informative (p < n /\ is_proposer p)
+      then sp_accepted (local s p) = Some p /\
+           sp_sent_ordinary (local s p) = Some p /\
+           sp_ordinary_acks (local s p) = [p]
+      else sp_accepted (local s p) = None /\
+           sp_sent_ordinary (local s p) = None /\
+           sp_ordinary_acks (local s p) = []) /\
+  (forall p, sp_sent_leader (local s p) = None) /\
+  (forall p, sp_leader_acks (local s p) = []) /\
+  ((forall src dst,
+      src < n -> dst < n -> src <> dst -> is_proposer src ->
+      network s src dst = [SPProposal src]) /\
+   (forall src dst,
+      ~ (src < n /\ dst < n /\ src <> dst /\ is_proposer src) ->
+      network s src dst = [])).
 
-(** Bundle of all protocol-specific parameters for this instantiation. *)
 Definition sp_instance : ACProtocol :=
   mkACProtocol sp_output is_proposer sp_init sp_step_fn.
 
-(* ================================================================
-   Shorthands for the Instantiated Definitions
-   ================================================================ *)
-
 Definition SP_GlobalState := GlobalState SPMsg SPState.
-Definition SP_Reachable   := Reachable n sp_instance.
+Definition SP_Reachable := Reachable n sp_instance.
 
 (* ================================================================
    Proofs
    ================================================================ *)
 
-(** Processes never discard an existing output. *)
-Lemma output_stable :
+Lemma sp_output_stable :
   forall p ls m o,
     sp_output ls = Some o ->
     sp_output (fst (sp_step_fn p ls m)) = Some o.
 Proof.
-  intros p ls m o H.
-  unfold sp_step_fn. rewrite H. simpl. exact H.
+  intros p ls m o Hout.
+  unfold sp_step_fn. rewrite Hout. simpl. exact Hout.
 Qed.
 
-Lemma all_message_values_valid :
+Lemma sp_output_facts :
   forall s,
     SP_Reachable s ->
-    (forall src dest,
-      src < n -> dest < n -> Forall (fun msg => is_proposer (sp_proposer msg)) (network s src dest)).
+    forall p o,
+      sp_output (local s p) = Some o ->
+      exists v,
+        o = Commit v /\
+        is_proposer v /\
+        sp_accepted (local s p) = Some v /\
+        sp_leader_choice (local s p) = Some v /\
+        (sp_direct_certificate (sp_ordinary_acks (local s p)) \/
+         sp_leader_certificate (sp_leader_acks (local s p))).
 Proof.
-  intros s Hs. induction Hs; simpl in H.
-  - (* init-case: only proposers have sent messages with their own value. *)
-    unfold sp_init in H; destruct H as [_ [[init_net_prop init_net_nonprop] init_net_self]].
-    intros src dest src_valid dest_valid. destruct (classic (is_proposer src)) as [Hprop | Hprop].
-    + destruct (classic (src = dest)) as [Heq | Hneq].
-      * (* no messages are sent to self *)
-        destruct Heq. rewrite (init_net_self src src_valid). constructor.
-      * (* proposer sending to others *)
-        rewrite (init_net_prop src dest src_valid dest_valid Hneq Hprop). constructor; auto.
-    + (* non-proposers send nothing initially *)
-      rewrite (init_net_nonprop src dest src_valid dest_valid Hprop). constructor; auto.
-  - (* step-case: try to dequeue a message and potentially send new ones *)
-    intros src0 dest. unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p_valid]] H].
-    destruct (network s src p) as [| msg rest] eqn:src_net.
-    + (* empty queue: nothing was done. *)
-      unfold state_eq in H. destruct H as [state_eq net_eq].
-      rewrite net_eq. auto.
-    + destruct H as [_ [H_net_p_in [H_net_p_out H_net_other]]].
-      intros src0_valid dest_valid.
-      destruct (classic (src = src0)).
-      * destruct H. destruct (classic (dest = p)).
-        -- (* Queue from which p consumed the message. *)
-          destruct H.
-          pose (IHHs src dest src0_valid dest_valid) as H.
-          rewrite src_net in H.
-          apply Forall_inv_tail in H.
-          destruct H_net_p_in. auto.
-        -- (* Other queues from the same source: unchanged. *)
-          rewrite H_net_other; auto.
-      * destruct (classic (p = src0)).
-        -- (* p's outgoing queues: gained the replies from sp_step_fn. *)
-          destruct H0.
-          rewrite H_net_p_out.
-          apply Forall_app. split.
-          ++ (* Pre-existing messages: valid by IHHs. *)
-            auto.
-          ++ (* New messages emitted by sp_step_fn: *)
-            unfold sp_step_fn.
-            destruct (sp_output (local s p)); auto. (* output already set: no new messages *)
-            destruct (sp_accepted (local s p)).
-            ** (* Already accepted: no new messages (or sends nothing new). *)
-              destruct (sp_proposer msg =? p0); simpl; auto.
-            ** (* Not yet accepted: sends replies to proposer (with same value). *)
-              simpl. destruct (dest =? sp_proposer msg); auto.
-              rewrite Forall_cons_iff; split; auto.
-              simpl.
-              pose (IHHs src p src_valid p_valid) as Hmsg.
-              rewrite src_net in Hmsg.
-              apply Forall_inv in Hmsg.
-              apply Hmsg.
-        -- (* All the other queues: unchanged. *)
-          rewrite H_net_other; auto.
-Qed.
-
-Lemma all_accepted_values_valid :
-  forall s,
-    SP_Reachable s ->
-    (forall p, p < n -> match sp_accepted (local s p) with
-        | None => True
-        | Some(value) => is_proposer value
-      end).
-Proof.
-  intros s Hs p p_valid. induction Hs; simpl in H.
-  - (* init case *)
-    unfold sp_init in H; destruct H as [[_ [[prop_acc nonprop_acc] _]] _].
-    destruct (classic (is_proposer p)) as [prop | not_prop].
-    + rewrite (prop_acc p p_valid prop). auto.
-    + rewrite (nonprop_acc p p_valid not_prop). auto.
-  - (* step case *)
-    unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p0_valid]] H].
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + (* no message from src: no-op *)
-      unfold state_eq in H. destruct H as [local_eq _].
-      rewrite local_eq. exact IHHs.
-    + destruct H as [[p0_state other_state] _].
-      destruct (classic (p = p0)).
-      * (* state of the stepping process *)
-        destruct H. rewrite p0_state.
-        unfold sp_step_fn.
-        destruct (sp_output (local s p)); auto.
-        destruct (sp_accepted (local s p)) eqn:prev_acc.
-        -- (* already accepted value before: Use IHHs *)
-          destruct (Nat.eqb (sp_proposer f0) p0); simpl.
-          ++ exact IHHs.
-          ++ rewrite prev_acc. exact IHHs.
-        -- (* will accept the message's value. *)
-          simpl.
-          pose proof (all_message_values_valid s Hs src p src_valid p_valid) as Hmsg.
-          rewrite src_net in Hmsg.
-          exact (Forall_inv Hmsg).
-      * (* p != p0: other processes local state are unchanged *)
-        rewrite (other_state p H).
-        exact IHHs.
-Qed.
-
-Lemma all_output_values_valid :
-  forall s,
-    SP_Reachable s ->
-    forall p, p < n ->
-      match sp_output (local s p) with
-      | None => True
-      | Some (Commit v) => is_proposer v
-      | Some (Adopt v) => is_proposer v
-      end.
-Proof.
-  intros s Hs p p_valid. induction Hs; simpl in H.
-  - (* Init: all outputs are None. *)
-    unfold sp_init in H. destruct H as [[init_noout _] _].
-    rewrite (init_noout p). auto.
-  - (* Step: p0 receives the head message f0 from src. *)
-    unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p0_valid]] H].
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + (* Empty queue: no message delivered, local states unchanged. *)
-      unfold state_eq in H. destruct H as [local_eq _].
-      rewrite local_eq. exact IHHs.
-    + destruct H as [[p0_state other_state] _].
-      destruct (classic (p = p0)).
-      * (* p = p0: p's local state was updated by sp_step_fn. *)
-        destruct H. rewrite p0_state.
-        destruct (sp_output (local s p)) as [o|] eqn:prev_out.
-        -- (* Output already set: sp_step_fn leaves local state unchanged. *)
-          rewrite (output_stable p (local s p) f0 o prev_out).
-          exact IHHs.
-        -- (* No output yet: inspect accepted value. *)
-          unfold sp_step_fn. rewrite prev_out.
-          destruct (sp_accepted (local s p)) as [v|] eqn:prev_acc.
-          ++ destruct (Nat.eqb (sp_proposer f0) v).
-            ** (* Accepted value matches: might commit. *)
-              simpl.
-              pose proof (all_accepted_values_valid s Hs p p_valid) as Hacc.
-              rewrite prev_acc in Hacc.
-              destruct (sp_quorum <=? _); auto.
-            ** (* Accepted value does not match: state unchanged. *)
-              simpl. rewrite prev_out. auto.
-          ++ (* Not yet accepted: will accept proposer f0, output stays None. *)
-            simpl. auto.
-      * (* p != p0: p's local state is unchanged. *)
-        rewrite (other_state p H).
-        exact IHHs.
+  intros s Hreach.
+  induction Hreach as [s Hinit | recv src s s' Hreach IH Hstep].
+  - unfold sp_init in Hinit. destruct Hinit as [Hnone _].
+    intros p o Hout. rewrite (Hnone p) in Hout. discriminate.
+  - unfold step, sp_instance in Hstep; simpl in Hstep.
+    destruct Hstep as [[_ [_ Hrecv]] Hstep].
+    destruct (network s src recv) as [|m rest] eqn:Hqueue.
+    + unfold state_eq in Hstep. destruct Hstep as [Hlocal _].
+      intros p o Hout. rewrite Hlocal in Hout.
+      rewrite Hlocal. exact (IH p o Hout).
+    + destruct Hstep as [[Hstate Hothers] _].
+      intros p o Hout.
+      destruct (classic (p = recv)) as [-> | Hneq].
+      * rewrite Hstate in Hout.
+        destruct (sp_output (local s recv)) as [old|] eqn:Hprev.
+        -- unfold sp_step_fn in Hout. rewrite Hprev in Hout. simpl in Hout.
+           rewrite Hstate. unfold sp_step_fn. rewrite Hprev. simpl.
+           exact (IH recv o Hout).
+        -- unfold sp_step_fn in Hout. rewrite Hprev in Hout.
+           destruct m as [v | v | ack_src v kind].
+           ++ destruct (recv =? leader); simpl in Hout.
+              ** destruct (sp_leader_choice (local s recv)); simpl in Hout.
+                 --- rewrite Hprev in Hout. discriminate.
+                 --- discriminate.
+              ** destruct (sp_accepted (local s recv)); simpl in Hout.
+                 --- rewrite Hprev in Hout. discriminate.
+                 --- discriminate.
+           ++ destruct (recv =? leader); simpl in Hout.
+              ** rewrite Hprev in Hout. discriminate.
+              ** destruct (sp_leader_choice (local s recv)); simpl in Hout.
+                 --- rewrite Hprev in Hout. discriminate.
+                 --- discriminate.
+           ++ destruct (sp_accepted (local s recv)) as [w|] eqn:Hacc.
+              ** destruct (v =? w) eqn:Heq.
+                 --- apply Nat.eqb_eq in Heq. subst v.
+                     destruct kind; simpl in Hout.
+                     +++ destruct (ack_src =? leader) eqn:Hsrc.
+                         { simpl in Hout.
+                           unfold sp_maybe_commit in Hout; simpl in Hout.
+                           destruct (excluded_middle_informative _)
+                             as [Hfacts | Hfacts].
+                           { simpl in Hout. injection Hout as Ho. subst o.
+                             rewrite Hstate. unfold sp_step_fn.
+                             rewrite Hprev, Hacc, Nat.eqb_refl. simpl.
+                             rewrite Hsrc. simpl.
+                             exists w; intuition. }
+                           { simpl in Hout. discriminate. } }
+                         { simpl in Hout.
+                           unfold sp_maybe_commit in Hout; simpl in Hout.
+                           destruct (excluded_middle_informative _)
+                             as [Hfacts | Hfacts].
+                           { simpl in Hout. injection Hout as Ho. subst o.
+                             rewrite Hstate. unfold sp_step_fn.
+                             rewrite Hprev, Hacc, Nat.eqb_refl. simpl.
+                             rewrite Hsrc. simpl.
+                             exists w; intuition. }
+                           { simpl in Hout. discriminate. } }
+                     +++ unfold sp_maybe_commit in Hout; simpl in Hout.
+                         destruct (excluded_middle_informative _)
+                           as [Hfacts | Hfacts].
+                         { simpl in Hout. injection Hout as Ho. subst o.
+                           rewrite Hstate. unfold sp_step_fn.
+                           rewrite Hprev, Hacc, Nat.eqb_refl. simpl.
+                           exists w; intuition. }
+                         { simpl in Hout. discriminate. }
+                 --- simpl in Hout. rewrite Hprev in Hout. discriminate.
+              ** simpl in Hout. congruence.
+      * rewrite (Hothers p Hneq) in Hout.
+        rewrite (Hothers p Hneq).
+        exact (IH p o Hout).
 Qed.
 
 Theorem SwiftPaxos_Validity : Validity n sp_instance.
 Proof.
   unfold Validity, sp_instance, output_of, valid_pid; simpl.
-  intros s p v Hs p_valid [Hout | Hout];
-    pose proof (all_output_values_valid s Hs p p_valid) as Hvalid;
-    rewrite Hout in Hvalid; exact Hvalid.
-Qed.
-
-(** sp_step_fn never changes an already-accepted value. *)
-Lemma accepted_stable :
-  forall p ls m v,
-    sp_accepted ls = Some v ->
-    sp_accepted (fst (sp_step_fn p ls m)) = Some v.
-Proof.
-  intros p ls m v Hacc.
-  unfold sp_step_fn.
-  destruct (sp_output ls); [simpl; exact Hacc |].
-  rewrite Hacc. simpl.
-  destruct (Nat.eqb (sp_proposer m) v); simpl; [reflexivity | exact Hacc].
-Qed.
-
-(** The source of every message has accepted the value. *)
-Lemma msg_src_has_accepted :
-  forall s,
-    SP_Reachable s ->
-    forall src dest,
-      src < n -> dest < n ->
-      Forall (fun msg => sp_source msg = src /\
-                         sp_accepted (local s src) = Some (sp_proposer msg))
-             (network s src dest).
-Proof.
-  intros s Hs. induction Hs; simpl in H.
-  - unfold sp_init in H.
-    destruct H as [[_ [[prop_acc _] _]] [[prop_net nonprop_net] net_self]].
-    intros src dest src_valid dest_valid.
-    destruct (classic (is_proposer src)) as [Hprop | Hprop].
-    + destruct (classic (src = dest)) as [Heq | Hneq].
-      * destruct Heq. rewrite (net_self src src_valid). constructor.
-      * rewrite (prop_net src dest src_valid dest_valid Hneq Hprop).
-        constructor; [| constructor]. simpl. split.
-        -- reflexivity.
-        -- rewrite (prop_acc src src_valid Hprop). reflexivity.
-    + rewrite (nonprop_net src dest src_valid dest_valid Hprop). constructor.
-  - unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p_valid]] H].
-    destruct (network s src p) as [| f0 ] eqn:src_net.
-    + (* No message delivered. *)
-      unfold state_eq in H. destruct H as [local_eq net_eq].
-      intros src0 dest src0_valid dest_valid.
-      rewrite net_eq.
-      eapply Forall_impl.
-      2: exact (IHHs src0 dest src0_valid dest_valid).
-      intros msg [Hsrc Hacc]. split; [exact Hsrc | rewrite local_eq; exact Hacc].
-    + destruct H as [[p0_state other_state] [H_net_p_in [H_net_p_out H_net_other]]].
-      intros src0 dest src0_valid dest_valid.
-      destruct (classic (src0 = src)) as [Hsrc0 | Hsrc0].
-      * subst src0.
-        destruct (classic (dest = p)) as [Hdest | Hdest].
-        -- (* src -> p: head consumed, rest unchanged. *)
-           subst dest. rewrite H_net_p_in.
-           pose proof (IHHs src p src_valid p_valid) as Hold.
-           rewrite src_net in Hold. apply Forall_inv_tail in Hold.
-           eapply Forall_impl.
-           2: exact Hold.
-           intros msg [Hsrc Hacc]. split; [exact Hsrc |].
-           rewrite (other_state src p_not_src). exact Hacc.
-        -- (* src -> other dest: queue unchanged. *)
-           rewrite (H_net_other src dest p_not_src (or_introl Hdest)).
-           eapply Forall_impl.
-           2: exact (IHHs src dest src_valid dest_valid).
-           intros msg [Hsrc Hacc]. split; [exact Hsrc |].
-           rewrite (other_state src p_not_src). exact Hacc.
-      * destruct (classic (src0 = p)) as [Hsp | Hsp].
-        -- (* p's outgoing queues: new messages from sp_step_fn. *)
-           subst src0. rewrite H_net_p_out. rewrite Forall_app. split.
-           ++ (* Old messages. *)
-              eapply Forall_impl.
-              2: exact (IHHs p dest p_valid dest_valid).
-              intros msg [Hsrcmsg Hacc]. split; [exact Hsrcmsg |].
-              rewrite p0_state.
-              exact (accepted_stable p (local s p) f0 (sp_proposer msg) Hacc).
-           ++ (* New messages. *)
-              unfold sp_step_fn.
-              destruct (sp_output (local s p)) as [o|] eqn:Hout; [simpl; constructor |].
-              destruct (sp_accepted (local s p)) as [v|] eqn:Hacc_eq.
-              ** destruct (Nat.eqb (sp_proposer f0) v); simpl; constructor.
-              ** simpl. destruct (dest =? sp_proposer f0) eqn:Hdest_eq; [| constructor].
-                 apply Nat.eqb_eq in Hdest_eq. subst dest.
-                 constructor; [| constructor]. simpl. split.
-                 { reflexivity. }
-                 { rewrite p0_state. unfold sp_step_fn. rewrite Hout. rewrite Hacc_eq.
-                   simpl. reflexivity. }
-        -- (* Other queues unchanged. *)
-           rewrite (H_net_other src0 dest Hsp (or_intror Hsrc0)).
-           eapply Forall_impl.
-           2: exact (IHHs src0 dest src0_valid dest_valid).
-           intros msg [Hsrc Hacc]. split; [exact Hsrc |].
-           rewrite (other_state src0 Hsp). exact Hacc.
-Qed.
-
-Lemma nodup_in_acceptors :
-  forall s,
-    SP_Reachable s ->
-    forall p, p < n -> NoDup (sp_acceptors (local s p)).
-Proof.
-  intros s Hs p p_valid. induction Hs; simpl in H.
-  - (* Init *)
-    unfold sp_init in H. destruct H as [[_ [_ [init_prop_acc init_nonprop_acc]]] _].
-    destruct (classic (is_proposer p)) as [Hprop | Hprop].
-    + (* Proposers. *)
-      rewrite (init_prop_acc p p_valid Hprop).
-      apply NoDup_cons; [intro Hin; exact Hin | constructor].
-    + (* Non-proposers. *)
-      rewrite (init_nonprop_acc p p_valid Hprop). constructor.
-  - (* Step *)
-    unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p0_valid]] H].
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + (* No message delivered. *)
-      unfold state_eq in H. destruct H as [local_eq _].
-      rewrite local_eq. exact IHHs.
-    + destruct H as [[p0_state other_state] _].
-      destruct (classic (p = p0)).
-      * (* state of the running process. *)
-        destruct H. rewrite p0_state. unfold sp_step_fn.
-        destruct (sp_output (local s p)).
-        -- (* Output already set. *)
-           simpl. exact IHHs.
-        -- destruct (sp_accepted (local s p)) eqn:prev_acc.
-          ++ destruct (Nat.eqb (sp_proposer f0) p0).
-            ** (* Proposer matches. *)
-              simpl.
-              destruct (existsb (Nat.eqb (sp_source f0)) (sp_acceptors (local s p))) eqn:Hexists; try exact IHHs.
-              apply NoDup_cons; try exact IHHs.
-              intro Hin.
-              assert (existsb (Nat.eqb (sp_source f0)) (sp_acceptors (local s p)) = true)
-                as Hcontra
-                by (apply existsb_exists; exists (sp_source f0);
-                    split; [exact Hin | apply Nat.eqb_refl]).
-              rewrite Hexists in Hcontra. discriminate.
-            ** (* Proposer doesn't match. *)
-                simpl. exact IHHs.
-          ++ (* Not yet accepted: new acceptors list is []. *)
-            simpl. constructor.
-      * (* other process states are unchanged. *)
-        rewrite (other_state p H). exact IHHs.
-Qed.
-
-(** Every process in p's acceptor list has also accepted p's value. *)
-Lemma all_acceptors_have_accepted :
-  forall s,
-    SP_Reachable s ->
-    forall p v, p < n ->
-      sp_accepted (local s p) = Some v ->
-      forall r, In r (sp_acceptors (local s p)) ->
-        sp_accepted (local s r) = Some v.
-Proof.
-  intros s Hs p. induction Hs; simpl in H.
-  - unfold sp_init in H.
-    destruct H as [[_ [[prop_acc nonprop_acc] [prop_accs nonprop_accs]]] _].
-    intros v p_valid Hacc r Hr.
-    destruct (classic (is_proposer p)) as [Hprop | Hprop].
-    + rewrite (prop_accs p p_valid Hprop) in Hr.
-      simpl in Hr. destruct Hr as [Heq | []]. subst r. exact Hacc.
-    + rewrite (nonprop_accs p p_valid Hprop) in Hr. destruct Hr.
-  - unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p0_valid]] H].
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + unfold state_eq in H. destruct H as [local_eq _].
-      intros v p_valid Hacc r Hr.
-      rewrite (local_eq p) in Hacc, Hr. rewrite (local_eq r).
-      exact (IHHs v p_valid Hacc r Hr).
-    + destruct H as [[p0_state other_state] _].
-      pose proof (msg_src_has_accepted s Hs src p0 src_valid p0_valid) as Hmsg.
-      rewrite src_net in Hmsg. apply Forall_inv in Hmsg.
-      destruct Hmsg as [Hsrc_f0 Hacc_src].
-      intros v p_valid Hacc r Hr.
-      destruct (classic (p = p0)) as [Hpp0 | Hpp0].
-      * subst p0. rewrite p0_state in Hacc, Hr.
-        unfold sp_step_fn in Hacc, Hr.
-        destruct (sp_output (local s p)) as [o|] eqn:Hout.
-        -- simpl in Hacc, Hr.
-           pose proof (IHHs v p_valid Hacc r Hr) as Hrfp.
-           destruct (classic (r = p)) as [Hrp | Hrp].
-           ++ subst r. rewrite p0_state.
-              exact (accepted_stable p (local s p) f0 v Hrfp).
-           ++ rewrite (other_state r Hrp). exact Hrfp.
-        -- destruct (sp_accepted (local s p)) as [w|] eqn:Hacc_p.
-          ++ destruct (Nat.eqb (sp_proposer f0) w) eqn:Hprop.
-            ** apply Nat.eqb_eq in Hprop.
-              simpl in Hacc. injection Hacc as Hwv. subst v.
-              simpl in Hr.
-              destruct (existsb (Nat.eqb (sp_source f0)) (sp_acceptors (local s p))) eqn:Hexists.
-              { simpl in Hr.
-                pose proof (IHHs w p_valid eq_refl r Hr) as Hrfp.
-                destruct (classic (r = p)) as [Hrp | Hrp].
-                - subst r. rewrite p0_state.
-                  exact (accepted_stable p (local s p) f0 w Hrfp).
-                - rewrite (other_state r Hrp). exact Hrfp. }
-              { simpl in Hr. destruct Hr as [Heq | Hr_old].
-                - rewrite <- Heq. rewrite Hsrc_f0.
-                  rewrite (other_state src p_not_src). congruence.
-                - pose proof (IHHs w p_valid eq_refl r Hr_old) as Hrfp.
-                  destruct (classic (r = p)) as [Hrp | Hrp].
-                  + subst r. rewrite p0_state.
-                    exact (accepted_stable p (local s p) f0 w Hrfp).
-                  + rewrite (other_state r Hrp). exact Hrfp. }
-            ** simpl in Hacc, Hr.
-              assert (Hvw : w = v) by congruence.
-              subst v.
-              pose proof (IHHs w p_valid eq_refl r Hr) as Hrfp.
-              destruct (classic (r = p)) as [Hrp | Hrp].
-              { subst r. rewrite p0_state.
-                exact (accepted_stable p (local s p) f0 w Hrfp). }
-              { rewrite (other_state r Hrp). exact Hrfp. }
-          ++ simpl in Hr. destruct Hr.
-      * rewrite (other_state p Hpp0) in Hacc, Hr.
-        pose proof (IHHs v p_valid Hacc r Hr) as Hrfp.
-        destruct (classic (r = p0)) as [Hrp0 | Hrp0].
-        -- subst r. rewrite p0_state.
-          exact (accepted_stable p0 (local s p0) f0 v Hrfp).
-        -- rewrite (other_state r Hrp0). exact Hrfp.
-Qed.
-
-Lemma commit_implies_accepted :
-  forall s, SP_Reachable s ->
-  forall p v, p < n ->
-    sp_output (local s p) = Some (Commit v) ->
-    sp_accepted (local s p) = Some v.
-Proof.
-  intros s Hs p. induction Hs; simpl in H.
-  - unfold sp_init in H. destruct H as [[init_noout _] _].
-    intros v p_valid Hout. rewrite (init_noout p) in Hout. discriminate.
-  - unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p0_valid]] H].
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + unfold state_eq in H. destruct H as [local_eq _].
-      intros v p_valid Hout. rewrite (local_eq p) in Hout.
-      rewrite (local_eq p). exact (IHHs v p_valid Hout).
-    + destruct H as [[p0_state other_state] _].
-      intros v p_valid Hout.
-      destruct (classic (p = p0)) as [Hpp0 | Hpp0].
-      * subst p0. rewrite p0_state in Hout.
-        unfold sp_step_fn in Hout.
-        destruct (sp_output (local s p)) as [o|] eqn:Hprev_out.
-        -- simpl in Hout.
-          assert (Ho : Some o = Some (Commit v)) by congruence.
-          rewrite p0_state. unfold sp_step_fn. rewrite Hprev_out. simpl.
-          exact (IHHs v p_valid Ho).
-        -- destruct (sp_accepted (local s p)) as [w|] eqn:Hacc_p.
-          ++ destruct (Nat.eqb (sp_proposer f0) w) eqn:Hprop.
-            ** apply Nat.eqb_eq in Hprop. subst w.
-              simpl in Hout.
-              destruct (sp_quorum <=? length _) eqn:Hle.
-              { injection Hout as Hveq. subst v.
-                rewrite p0_state. unfold sp_step_fn. rewrite Hprev_out. rewrite Hacc_p.
-                rewrite Nat.eqb_refl. simpl. reflexivity. }
-              { discriminate. }
-            ** simpl in Hout. rewrite Hprev_out in Hout. discriminate.
-          ++ simpl in Hout. discriminate.
-      * rewrite (other_state p Hpp0) in Hout.
-        rewrite (other_state p Hpp0).
-        exact (IHHs v p_valid Hout).
-Qed.
-
-Lemma commit_implies_quorum :
-  forall s, SP_Reachable s ->
-  forall p v, p < n ->
-    sp_output (local s p) = Some (Commit v) ->
-    sp_quorum <= length (sp_acceptors (local s p)).
-Proof.
-  intros s Hs p. induction Hs; simpl in H.
-  - unfold sp_init in H. destruct H as [[init_noout _] _].
-    intros v p_valid Hout. rewrite (init_noout p) in Hout. discriminate.
-  - unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p0_valid]] H].
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + unfold state_eq in H. destruct H as [local_eq _].
-      intros v p_valid Hout. rewrite (local_eq p) in Hout.
-      rewrite (local_eq p). exact (IHHs v p_valid Hout).
-    + destruct H as [[p0_state other_state] _].
-      intros v p_valid Hout.
-      destruct (classic (p = p0)) as [Hpp0 | Hpp0].
-      * subst p0. rewrite p0_state in Hout.
-        unfold sp_step_fn in Hout.
-        destruct (sp_output (local s p)) as [o|] eqn:Hprev_out.
-        -- simpl in Hout.
-          assert (Ho : Some o = Some (Commit v)) by congruence.
-          rewrite p0_state. unfold sp_step_fn. rewrite Hprev_out. simpl.
-          exact (IHHs v p_valid Ho).
-        -- destruct (sp_accepted (local s p)) as [w|] eqn:Hacc_p.
-          ++ destruct (Nat.eqb (sp_proposer f0) w) eqn:Hprop.
-            ** apply Nat.eqb_eq in Hprop. subst w.
-              simpl in Hout.
-              destruct (sp_quorum <=? length _) eqn:Hle.
-              { rewrite p0_state. unfold sp_step_fn. rewrite Hprev_out. rewrite Hacc_p.
-                rewrite Nat.eqb_refl. simpl.
-                apply Nat.leb_le. exact Hle. }
-              { discriminate. }
-            ** simpl in Hout. rewrite Hprev_out in Hout. discriminate.
-          ++ simpl in Hout. discriminate.
-      * rewrite (other_state p Hpp0) in Hout.
-        rewrite (other_state p Hpp0).
-        exact (IHHs v p_valid Hout).
-Qed.
-
-Lemma all_acceptors_are_valid :
-  forall s, SP_Reachable s ->
-  forall p, p < n ->
-  forall r, In r (sp_acceptors (local s p)) -> r < n.
-Proof.
-  intros s Hs p. induction Hs; simpl in H.
-  - unfold sp_init in H.
-    destruct H as [[_ [_ [prop_accs nonprop_accs]]] _].
-    intros p_valid r Hr.
-    destruct (classic (is_proposer p)) as [Hprop | Hprop].
-    + rewrite (prop_accs p p_valid Hprop) in Hr.
-      simpl in Hr. destruct Hr as [Heq | []]. subst r. exact p_valid.
-    + rewrite (nonprop_accs p p_valid Hprop) in Hr. destruct Hr.
-  - unfold step, sp_instance in H; simpl in H.
-    destruct H as [[p_not_src [src_valid p0_valid]] H].
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + unfold state_eq in H. destruct H as [local_eq _].
-      intros p_valid r Hr. rewrite (local_eq p) in Hr.
-      exact (IHHs p_valid r Hr).
-    + destruct H as [[p0_state other_state] _].
-      pose proof (msg_src_has_accepted s Hs src p0 src_valid p0_valid) as Hmsg.
-      rewrite src_net in Hmsg. apply Forall_inv in Hmsg.
-      destruct Hmsg as [Hsrc_f0 _].
-      intros p_valid r Hr.
-      destruct (classic (p = p0)) as [Hpp0 | Hpp0].
-      * subst p0. rewrite p0_state in Hr. unfold sp_step_fn in Hr.
-        destruct (sp_output (local s p)).
-        -- simpl in Hr. exact (IHHs p_valid r Hr).
-        -- destruct (sp_accepted (local s p)) as [w|] eqn:Hacc_p.
-          ++ destruct (Nat.eqb (sp_proposer f0) w) eqn:Hprop.
-            ** simpl in Hr.
-              destruct (existsb (Nat.eqb (sp_source f0)) (sp_acceptors (local s p))) eqn:Hexists.
-              { simpl in Hr. exact (IHHs p_valid r Hr). }
-              { simpl in Hr. destruct Hr as [Heq | Hr_old].
-                - subst r. rewrite Hsrc_f0. exact src_valid.
-                - exact (IHHs p_valid r Hr_old). }
-            ** simpl in Hr. exact (IHHs p_valid r Hr).
-          ++ simpl in Hr. destruct Hr.
-      * rewrite (other_state p Hpp0) in Hr.
-        exact (IHHs p_valid r Hr).
-Qed.
-
-(** Key lemma: two fast quorums must intersect. *)
-Lemma sp_quorum_gt_half : n < 2 * sp_quorum.
-Proof.
-  unfold sp_quorum.
-  rewrite n_eq_2f_plus_1.
-  pose proof (Nat.div_mod (f + 1) 2 ltac:(lia)) as H1.
-  pose proof (Nat.mod_upper_bound (f + 1) 2 ltac:(lia)) as H2.
-  lia.
-Qed.
-
-Lemma quorum_intersection :
-  forall (A B : list ProcessId),
-    NoDup A -> (forall a, In a A -> a < n) ->
-    NoDup B -> (forall b, In b B -> b < n) ->
-    sp_quorum <= length A -> sp_quorum <= length B ->
-    exists r, In r A /\ In r B.
-Proof.
-  intros A B Hnd_A Hval_A Hnd_B Hval_B Hlen_A Hlen_B.
-  apply Classical_Pred_Type.not_all_not_ex.
-  intro Hall.
-  assert (Hdisj : forall r, In r A -> ~ In r B).
-  { intros r Hr HrB. exact (Hall r (conj Hr HrB)). }
-  assert (Hnd_AB : NoDup (A ++ B)).
-  { apply NoDup_app; auto. }
-  assert (Hincl : incl (A ++ B) (seq 0 n)).
-  { intros x Hx. apply in_app_iff in Hx.
-    apply in_seq. split; [lia |].
-    destruct Hx as [Hx | Hx]; [exact (Hval_A x Hx) | exact (Hval_B x Hx)]. }
-  pose proof (NoDup_incl_length Hnd_AB Hincl) as Hle.
-  rewrite length_app, length_seq in Hle.
-  pose proof sp_quorum_gt_half.
-  lia.
-Qed.
-
-Lemma no_adopt :
-  forall s, SP_Reachable s ->
-  forall q w, q < n ->
-    sp_output (local s q) <> Some (Adopt w).
-Proof.
-  intros s Hs q. induction Hs; simpl in H.
-  - unfold sp_init in H. destruct H as [[init_noout _] _].
-    intros w q_valid Hq. rewrite (init_noout q) in Hq. discriminate.
-  - unfold step, sp_instance in H; simpl in H.
-    destruct H as [[_ [_ p_valid]] H].
-    intros w q_valid Hq.
-    destruct (network s src p) as [| f0 ] eqn:src_net.
-    + unfold state_eq in H. destruct H as [local_eq _].
-      rewrite (local_eq q) in Hq. exact (IHHs w q_valid Hq).
-    + destruct H as [[p_state other_state] _].
-      destruct (classic (q = p)) as [Hqp | Hqp].
-      * subst p. rewrite p_state in Hq. unfold sp_step_fn in Hq.
-        destruct (sp_output (local s q)) as [o|] eqn:Hprev.
-        -- simpl in Hq. exact (IHHs w q_valid (eq_trans (eq_sym Hprev) Hq)).
-        -- destruct (sp_accepted (local s q)).
-          ++ destruct (Nat.eqb _ _).
-            ** simpl in Hq. destruct (sp_quorum <=? _); discriminate.
-            ** simpl in Hq. exact (IHHs w q_valid (eq_trans (eq_sym Hprev) Hq)).
-          ++ simpl in Hq. discriminate.
-      * rewrite (other_state q Hqp) in Hq. exact (IHHs w q_valid Hq).
-Qed.
-
-Theorem SwiftPaxos_Agreement : Agreement n sp_instance.
-Proof.
-  unfold Agreement, sp_instance, output_of, valid_pid, acp_proc_output; simpl.
-  intros s p q v w Hs p_valid q_valid Hp Hq.
-  destruct Hq as [Hq | Hq].
-  - pose proof (commit_implies_accepted s Hs p v p_valid Hp) as Hacc_p.
-    pose proof (commit_implies_quorum s Hs p v p_valid Hp) as Hquorum_p.
-    pose proof (commit_implies_accepted s Hs q w q_valid Hq) as Hacc_q.
-    pose proof (commit_implies_quorum s Hs q w q_valid Hq) as Hquorum_q.
-    pose proof (nodup_in_acceptors s Hs p p_valid) as Hnd_p.
-    pose proof (nodup_in_acceptors s Hs q q_valid) as Hnd_q.
-    pose proof (fun r Hr => all_acceptors_are_valid s Hs p p_valid r Hr) as Hval_p.
-    pose proof (fun r Hr => all_acceptors_are_valid s Hs q q_valid r Hr) as Hval_q.
-    destruct (quorum_intersection
-                (sp_acceptors (local s p)) (sp_acceptors (local s q))
-                Hnd_p Hval_p Hnd_q Hval_q Hquorum_p Hquorum_q)
-      as [r [HrA HrB]].
-    pose proof (all_acceptors_have_accepted s Hs p v p_valid Hacc_p r HrA) as Hrv.
-    pose proof (all_acceptors_have_accepted s Hs q w q_valid Hacc_q r HrB) as Hrw.
-    congruence.
-  - destruct (no_adopt s Hs q w q_valid Hq).
+  intros s p v Hreach Hp [Hout | Hout].
+  - destruct (sp_output_facts s Hreach p (Commit v) Hout)
+      as [w [Heq [Hvalid _]]].
+    injection Heq as Heq. subst w. exact Hvalid.
+  - destruct (sp_output_facts s Hreach p (Adopt v) Hout)
+      as [w [Heq _]].
+    discriminate.
 Qed.
 
 Theorem SwiftPaxos_Convergence : Convergence n sp_instance.
 Proof.
-  unfold Convergence, sp_instance, output_of, valid_pid, acp_proc_output, acp_is_proposer; simpl.
-  intros s p q o Hs p_valid q_valid Hprop Huniq Hout.
-  pose proof (all_output_values_valid s Hs q q_valid) as Hvalid.
-  rewrite Hout in Hvalid.
-  destruct o as [v | v].
-  - f_equal. exact (Huniq v Hvalid).
-  - destruct (no_adopt s Hs q v q_valid Hout).
+  unfold Convergence, sp_instance, output_of, valid_pid; simpl.
+  intros s p q o Hreach Hp Hq Hprop Hunique Hout.
+  destruct (sp_output_facts s Hreach q o Hout)
+    as [v [Ho [Hvalid _]]].
+  subst o. f_equal. apply Hunique. exact Hvalid.
 Qed.
 
-(** Any committed process has a valid PID (< n). *)
-Lemma sp_commit_pid_valid :
-  forall s, SP_Reachable s ->
-  forall p v, sp_output (local s p) = Some (Commit v) -> p < n.
+Definition sp_choice_msg_ok (lc : option ProcessId) (m : SPMsg) : Prop :=
+  match m with
+  | SPProposal _ => True
+  | SPLeaderForward v => lc = Some v
+  | SPAck src v OrdinaryAck => src = leader -> lc = Some v
+  | SPAck _ v LeaderChoiceAck => lc = Some v
+  end.
+
+Definition sp_choice_invariant (s : SP_GlobalState) : Prop :=
+  (forall p v,
+      sp_leader_choice (local s p) = Some v ->
+      sp_leader_choice (local s leader) = Some v) /\
+  (forall src dst,
+      Forall
+        (sp_choice_msg_ok (sp_leader_choice (local s leader)))
+        (network s src dst)).
+
+Lemma sp_choice_msg_monotone :
+  forall old new m,
+    (old = None \/ new = old) ->
+    sp_choice_msg_ok old m ->
+    sp_choice_msg_ok new m.
 Proof.
-  intros s Hs p v. induction Hs; simpl in H.
-  - unfold sp_init in H. destruct H as [[init_noout _] _].
-    intro Hout. rewrite (init_noout p) in Hout. discriminate.
-  - unfold step, sp_instance in H; simpl in H.
-    destruct H as [[_ [_ p0_valid]] H].
-    intro Hout.
-    destruct (network s src p0) as [| f0 ] eqn:src_net.
-    + unfold state_eq in H. destruct H as [local_eq _].
-      rewrite (local_eq p) in Hout. exact (IHHs Hout).
-    + destruct H as [[p0_state other_state] _].
-      destruct (classic (p = p0)) as [Hpp0 | Hpp0].
-      * subst p0. exact p0_valid.
-      * rewrite (other_state p Hpp0) in Hout. exact (IHHs Hout).
+  intros old new m Hmono Hok.
+  destruct Hmono as [-> | ->]; [|exact Hok].
+  destruct m as [v | v | src v kind]; simpl in *; auto.
+  - discriminate.
+  - destruct kind; simpl in *.
+    + intros Hsrc. specialize (Hok Hsrc). discriminate.
+    + discriminate.
 Qed.
 
-(** General pigeonhole: two NoDup lists over {0..m-1} whose sizes sum to > m must share an element. *)
-Lemma list_intersection :
-  forall (A B : list ProcessId) (m : nat),
-    NoDup A -> (forall a, In a A -> a < m) ->
-    NoDup B -> (forall b, In b B -> b < m) ->
-    m < length A + length B ->
-    exists r, In r A /\ In r B.
+Lemma sp_local_choice_monotone :
+  forall p ls m,
+    sp_leader_choice ls = None \/
+    sp_leader_choice (fst (sp_step_fn p ls m)) =
+      sp_leader_choice ls.
 Proof.
-  intros A B m Hnd_A Hval_A Hnd_B Hval_B Hlt.
-  apply Classical_Pred_Type.not_all_not_ex.
-  intro Hall.
-  assert (Hdisj : forall r, In r A -> ~ In r B).
-  { intros r Hr HrB. exact (Hall r (conj Hr HrB)). }
-  assert (Hnd_AB : NoDup (A ++ B)) by (apply NoDup_app; auto).
-  assert (Hincl : incl (A ++ B) (seq 0 m)).
-  { intros x Hx. apply in_app_iff in Hx.
-    apply in_seq. split; [lia |].
-    destruct Hx; [exact (Hval_A x H) | exact (Hval_B x H)]. }
-  pose proof (NoDup_incl_length Hnd_AB Hincl) as Hle.
-  rewrite length_app, length_seq in Hle. lia.
+  intros p ls m.
+  unfold sp_step_fn.
+  destruct (sp_output ls) eqn:Hout; simpl; [right; reflexivity |].
+  destruct m as [v | v | src v kind].
+  - destruct (p =? leader); simpl.
+    + destruct (sp_leader_choice ls) eqn:Hchoice; simpl.
+      * right. exact Hchoice.
+      * left. reflexivity.
+    + destruct (sp_accepted ls); simpl; right; reflexivity.
+  - destruct (p =? leader); simpl.
+    + right. reflexivity.
+    + destruct (sp_leader_choice ls) eqn:Hchoice; simpl.
+      * right. exact Hchoice.
+      * left. reflexivity.
+  - destruct (sp_accepted ls) as [w|]; simpl.
+    + destruct (v =? w); simpl.
+      * destruct kind; simpl.
+        -- destruct (src =? leader); simpl.
+           ++ unfold sp_record_choice.
+              destruct (sp_leader_choice ls) eqn:Hchoice; simpl.
+               ** right. reflexivity.
+              ** left. reflexivity.
+           ++ right. reflexivity.
+        -- unfold sp_record_choice.
+           destruct (sp_leader_choice ls) eqn:Hchoice; simpl.
+           ++ right. reflexivity.
+           ++ left. reflexivity.
+      * right. reflexivity.
+    + right. reflexivity.
 Qed.
 
-(** The intersection of two NoDup bounded-nat lists has size at least |A| + |B| - m. *)
-Lemma filter_inter_lb :
-  forall (A B : list ProcessId) (m : nat),
-    NoDup A -> (forall a, In a A -> a < m) ->
-    NoDup B -> (forall b, In b B -> b < m) ->
-    length A + length B <= m + length (filter (fun a => existsb (Nat.eqb a) B) A).
+Lemma sp_step_choice_anchor :
+  forall lc p ls m,
+    (forall v, sp_leader_choice ls = Some v -> lc = Some v) ->
+    sp_choice_msg_ok lc m ->
+    forall v,
+      sp_leader_choice (fst (sp_step_fn p ls m)) = Some v ->
+      (if Nat.eqb p leader
+       then sp_leader_choice (fst (sp_step_fn p ls m))
+       else lc) = Some v.
 Proof.
-  intros A B m Hnd_A Hval_A Hnd_B Hval_B.
-  set (f_in := fun a => existsb (Nat.eqb a) B).
-  set (D := filter (fun a => negb (f_in a)) A).
-  assert (H_part : length (filter f_in A) + length D = length A).
-  { unfold D. exact (filter_length f_in A). }
-  assert (Hnd_D : NoDup D) by (apply NoDup_filter; exact Hnd_A).
-  assert (Hincl_D : incl D (filter (fun x => negb (f_in x)) (seq 0 m))).
-  { intros x Hx. apply filter_In in Hx as [HxA HxnB].
+  intros lc p ls m Hanchor Hmsg v Hnew.
+  destruct (Nat.eqb p leader) eqn:Hp.
+  - exact Hnew.
+  - unfold sp_step_fn in Hnew.
+    destruct (sp_output ls) eqn:Hout; simpl in Hnew.
+    + exact (Hanchor v Hnew).
+    + destruct m as [x | x | src x kind].
+      * rewrite Hp in Hnew. simpl in Hnew.
+        destruct (sp_accepted ls); simpl in Hnew;
+          exact (Hanchor v Hnew).
+      * rewrite Hp in Hnew. simpl in Hnew.
+        destruct (sp_leader_choice ls) eqn:Hchoice; simpl in Hnew.
+        -- rewrite Hchoice in Hnew. exact (Hanchor v Hnew).
+        -- injection Hnew as ->. exact Hmsg.
+      * destruct (sp_accepted ls) as [w|] eqn:Hacc; simpl in Hnew.
+        -- destruct (x =? w) eqn:Hx; simpl in Hnew.
+           ++ apply Nat.eqb_eq in Hx. subst x.
+              destruct kind; simpl in Hnew.
+              ** destruct (src =? leader) eqn:Hsrc; simpl in Hnew.
+                 --- unfold sp_record_choice in Hnew.
+                     destruct (sp_leader_choice ls) eqn:Hchoice;
+                       simpl in Hnew.
+                     +++ exact (Hanchor v Hnew).
+                     +++ injection Hnew as ->.
+                         apply Nat.eqb_eq in Hsrc. subst src.
+                         exact (Hmsg eq_refl).
+                 --- exact (Hanchor v Hnew).
+              ** unfold sp_record_choice in Hnew.
+                 destruct (sp_leader_choice ls) eqn:Hchoice;
+                   simpl in Hnew.
+                 --- exact (Hanchor v Hnew).
+                 --- injection Hnew as ->. exact Hmsg.
+           ++ exact (Hanchor v Hnew).
+        -- exact (Hanchor v Hnew).
+Qed.
+
+Lemma sp_step_new_messages_ok :
+  forall lc p ls m,
+    sp_choice_msg_ok lc m ->
+    forall dst,
+      Forall
+        (sp_choice_msg_ok
+           (if Nat.eqb p leader
+            then sp_leader_choice (fst (sp_step_fn p ls m))
+            else lc))
+        (snd (sp_step_fn p ls m) dst).
+Proof.
+  intros lc p ls m Hmsg dst.
+  unfold sp_step_fn.
+  destruct (sp_output ls); simpl.
+  - constructor.
+  - destruct m as [v | v | src v kind].
+    + destruct (p =? leader) eqn:Hp; simpl.
+      * destruct (sp_leader_choice ls); simpl; [constructor |].
+      destruct (dst =? v); simpl; repeat constructor; simpl; auto.
+      * destruct (sp_accepted ls); simpl; [constructor |].
+      destruct (dst =? v); simpl; [|constructor].
+      constructor; [|constructor]. simpl.
+      intro Heq. apply Nat.eqb_neq in Hp. contradiction.
+    + destruct (p =? leader) eqn:Hp; simpl; [constructor |].
+      destruct (sp_leader_choice ls); simpl; [constructor |].
+      destruct (dst =? v); simpl; [|constructor].
+      constructor; [exact Hmsg | constructor].
+    + destruct (sp_accepted ls); simpl; [|constructor].
+      destruct (v =? p0); simpl; constructor.
+Qed.
+
+Lemma sp_choice_invariant_reachable :
+  forall s,
+    SP_Reachable s ->
+    sp_choice_invariant s.
+Proof.
+  intros s Hreach.
+  induction Hreach as [s Hinit | recv src s s' Hreach IH Hstep].
+  - unfold sp_choice_invariant, sp_init in *.
+    destruct Hinit as [_ [Hchoices [_ [_ [_ [Hpropnet Hemptynet]]]]]].
+    split.
+    + intros p v Hchoice. rewrite (Hchoices p) in Hchoice. discriminate.
+    + intros src dst.
+      destruct (classic
+        (src < n /\ dst < n /\ src <> dst /\ is_proposer src))
+        as [[Hsrc [Hdst [Hneq Hprop]]] | Hnone].
+      * rewrite (Hpropnet src dst Hsrc Hdst Hneq Hprop).
+        constructor; simpl; constructor.
+      * rewrite (Hemptynet src dst Hnone). constructor.
+  - unfold sp_choice_invariant in IH.
+    destruct IH as [Hlocal_inv Hnetwork_inv].
+    unfold step, sp_instance in Hstep; simpl in Hstep.
+    destruct Hstep as [[Hneq [Hsrc Hrecv]] Hstep].
+    destruct (network s src recv) as [|m rest] eqn:Hqueue.
+    + unfold state_eq in Hstep. destruct Hstep as [Hlocal Hnetwork].
+      split.
+      * intros p v Hchoice. rewrite Hlocal in Hchoice.
+        rewrite Hlocal. exact (Hlocal_inv p v Hchoice).
+      * intros a b. rewrite Hnetwork.
+        rewrite (Hlocal leader).
+        exact (Hnetwork_inv a b).
+    + destruct Hstep as
+        [[Hstate Hothers] [Hconsume [Hsend Hunchanged]]].
+      pose proof (Hnetwork_inv src recv) as Hhead.
+      rewrite Hqueue in Hhead.
+      apply Forall_inv in Hhead.
+      set (oldlc := sp_leader_choice (local s leader)).
+      set (newlc :=
+        if Nat.eqb recv leader
+        then sp_leader_choice (fst (sp_step_fn recv (local s recv) m))
+        else oldlc).
+      assert (Hleader_new :
+        sp_leader_choice (local s' leader) = newlc).
+      { unfold newlc, oldlc.
+        destruct (Nat.eqb recv leader) eqn:Heq.
+        - apply Nat.eqb_eq in Heq. subst recv.
+          rewrite Hstate. reflexivity.
+        - apply Nat.eqb_neq in Heq.
+          rewrite (Hothers leader ltac:(intro H; apply Heq; symmetry; exact H)).
+          reflexivity. }
+      assert (Hlcmono : oldlc = None \/
+              sp_leader_choice (local s' leader) = oldlc).
+      { destruct (classic (recv = leader)) as [-> | Hnot].
+        - rewrite Hstate.
+          exact (sp_local_choice_monotone
+                   leader (local s leader) m).
+        - right.
+          rewrite (Hothers leader
+            ltac:(intro H; apply Hnot; symmetry; exact H)).
+          reflexivity. }
+      assert (Hnewmono : oldlc = None \/ newlc = oldlc).
+      { destruct Hlcmono as [Hnone | Hsame].
+        - left. exact Hnone.
+        - right. rewrite <- Hleader_new. exact Hsame. }
+      split.
+      * intros p v Hchoice.
+        destruct (classic (p = recv)) as [-> | Hp].
+        -- rewrite Hstate in Hchoice.
+           rewrite Hleader_new.
+           apply (sp_step_choice_anchor
+                    oldlc recv (local s recv) m).
+           ++ intros w Hw. unfold oldlc.
+              exact (Hlocal_inv recv w Hw).
+           ++ exact Hhead.
+           ++ exact Hchoice.
+        -- rewrite (Hothers p Hp) in Hchoice.
+           pose proof (Hlocal_inv p v Hchoice) as Hold.
+           destruct Hlcmono as [Hnone | Hsame].
+           ++ unfold oldlc in Hnone. rewrite Hnone in Hold. discriminate.
+           ++ rewrite Hsame. exact Hold.
+      * intros a b.
+        rewrite Hleader_new.
+        destruct (classic (a = recv)) as [-> | Ha].
+        -- rewrite Hsend. apply Forall_app. split.
+           ++ eapply Forall_impl.
+              2: exact (Hnetwork_inv recv b).
+              intros x Hx.
+              exact (sp_choice_msg_monotone
+                       oldlc newlc x Hnewmono Hx).
+           ++ unfold newlc.
+              exact (sp_step_new_messages_ok
+                       oldlc recv (local s recv) m Hhead b).
+        -- destruct (classic (b = recv)) as [-> | Hb].
+           ++ destruct (classic (a = src)) as [-> | Hasrc].
+              ** rewrite Hconsume.
+                 pose proof (Hnetwork_inv src recv) as Hold.
+                 rewrite Hqueue in Hold.
+                 apply Forall_inv_tail in Hold.
+                 eapply Forall_impl.
+                 2: exact Hold.
+                 intros x Hx.
+                 exact (sp_choice_msg_monotone
+                          oldlc newlc x Hnewmono Hx).
+              ** rewrite Hunchanged; auto.
+                 eapply Forall_impl.
+                 2: exact (Hnetwork_inv a recv).
+                 intros x Hx.
+                 exact (sp_choice_msg_monotone
+                          oldlc newlc x Hnewmono Hx).
+           ++ rewrite Hunchanged; auto.
+              eapply Forall_impl.
+              2: exact (Hnetwork_inv a b).
+              intros x Hx.
+              exact (sp_choice_msg_monotone
+                       oldlc newlc x Hnewmono Hx).
+Qed.
+
+Theorem SwiftPaxos_Agreement : Agreement n sp_instance.
+Proof.
+  unfold Agreement, sp_instance, output_of, valid_pid; simpl.
+  intros s p q v w Hreach Hp Hq Hpout [Hqout | Hqout].
+  - destruct (sp_output_facts s Hreach p (Commit v) Hpout)
+      as [v' [Hv' [_ [_ [Hchoicev _]]]]].
+    injection Hv' as ->.
+    destruct (sp_output_facts s Hreach q (Commit w) Hqout)
+      as [w' [Hw' [_ [_ [Hchoicew _]]]]].
+    injection Hw' as ->.
+    destruct (sp_choice_invariant_reachable s Hreach)
+      as [Hanchor _].
+    pose proof (Hanchor p v' Hchoicev) as Hvleader.
+    pose proof (Hanchor q w' Hchoicew) as Hwleader.
+    congruence.
+  - destruct (sp_output_facts s Hreach q (Adopt w) Hqout)
+      as [x [Hx _]].
+    discriminate.
+Qed.
+
+Lemma sp_sent_ordinary_stable :
+  forall p ls m v,
+    sp_sent_ordinary ls = Some v ->
+    sp_sent_ordinary (fst (sp_step_fn p ls m)) = Some v.
+Proof.
+  intros p ls m v Hsent.
+  unfold sp_step_fn.
+  destruct (sp_output ls); simpl; auto.
+  destruct m as [x | x | src x kind].
+  - destruct (p =? leader); simpl.
+    + destruct (sp_leader_choice ls); simpl; auto.
+      unfold sp_record_choice. rewrite Hsent. reflexivity.
+    + destruct (sp_accepted ls); simpl; auto.
+      unfold sp_record_choice. rewrite Hsent. reflexivity.
+  - destruct (p =? leader); simpl; auto.
+    destruct (sp_leader_choice ls); simpl; auto.
+  - destruct (sp_accepted ls); simpl; auto.
+    destruct (x =? p0); simpl; auto.
+    destruct kind; simpl; exact Hsent.
+Qed.
+
+Lemma sp_leader_empty_vote_preserved :
+  forall ls m,
+    sp_leader_choice ls = None ->
+    sp_sent_ordinary ls = None ->
+    sp_leader_choice (fst (sp_step_fn leader ls m)) = None ->
+    sp_sent_ordinary (fst (sp_step_fn leader ls m)) = None.
+Proof.
+  intros ls m Hchoice Hsent Hnew.
+  unfold sp_step_fn in *.
+  destruct (sp_output ls); simpl in *; auto.
+  destruct m as [v | v | src v kind].
+  - rewrite Nat.eqb_refl in *. rewrite Hchoice in *. simpl in *.
+    discriminate.
+  - rewrite Nat.eqb_refl in *. exact Hsent.
+  - destruct (sp_accepted ls); simpl in *; auto.
+    destruct (v =? p); simpl in *; auto.
+    destruct kind; simpl in *; exact Hsent.
+Qed.
+
+Lemma sp_add_in :
+  forall x y xs,
+    In x (sp_add y xs) ->
+    x = y \/ In x xs.
+Proof.
+  intros x y xs Hin.
+  unfold sp_add in Hin.
+  destruct (existsb (Nat.eqb y) xs).
+  - right. exact Hin.
+  - simpl in Hin. destruct Hin as [-> | Hin]; auto.
+Qed.
+
+Definition sp_evidence_msg_ok
+    (s : SP_GlobalState) (queue_src : ProcessId) (m : SPMsg) : Prop :=
+  match m with
+  | SPAck src v OrdinaryAck =>
+      src = queue_src /\
+      sp_sent_ordinary (local s src) = Some v
+  | SPAck src v LeaderChoiceAck =>
+      src = queue_src /\
+      sp_leader_choice (local s src) = Some v
+  | _ => True
+  end.
+
+Definition sp_evidence_invariant (s : SP_GlobalState) : Prop :=
+  (forall p,
+      sp_accepted (local s p) = None ->
+      sp_ordinary_acks (local s p) = [] /\
+      sp_leader_acks (local s p) = [] /\
+      sp_sent_ordinary (local s p) = None) /\
+  (sp_leader_choice (local s leader) = None ->
+   sp_sent_ordinary (local s leader) = None) /\
+  (forall owner v src,
+      sp_accepted (local s owner) = Some v ->
+      In src (sp_ordinary_acks (local s owner)) ->
+      sp_sent_ordinary (local s src) = Some v) /\
+  (forall owner v src,
+      sp_accepted (local s owner) = Some v ->
+      In src (sp_leader_acks (local s owner)) ->
+      sp_leader_choice (local s src) = Some v) /\
+  (forall src dst,
+      Forall (sp_evidence_msg_ok s src) (network s src dst)).
+
+Lemma sp_evidence_msg_preserved :
+  forall s s' queue_src m,
+    (forall p v,
+      sp_sent_ordinary (local s p) = Some v ->
+      sp_sent_ordinary (local s' p) = Some v) ->
+    (forall p v,
+      sp_leader_choice (local s p) = Some v ->
+      sp_leader_choice (local s' p) = Some v) ->
+    sp_evidence_msg_ok s queue_src m ->
+    sp_evidence_msg_ok s' queue_src m.
+Proof.
+  intros s s' queue_src m Hsent Hchoice Hok.
+  unfold sp_evidence_msg_ok in *.
+  destruct m as [v | v | src v kind]; auto.
+  destruct kind.
+  - destruct Hok as [-> Hok]. split; [reflexivity |].
+    exact (Hsent queue_src v Hok).
+  - destruct Hok as [-> Hok]. split; [reflexivity |].
+    exact (Hchoice queue_src v Hok).
+Qed.
+
+Lemma sp_evidence_invariant_reachable :
+  forall s,
+    SP_Reachable s ->
+    sp_evidence_invariant s.
+Proof.
+  intros s Hreach.
+  induction Hreach as [s Hinit | recv qsrc s s' Hreach IH Hstep].
+  - unfold sp_evidence_invariant, sp_init in *.
+    destruct Hinit as
+      [Hout [Hchoice [Haccepted [Hsentleader [Hleaderacks Hnetwork]]]]].
+    split.
+    + intros p Hnone.
+      specialize (Haccepted p).
+      destruct (excluded_middle_informative (p < n /\ is_proposer p)).
+      * destruct Haccepted as [Hacc _]. rewrite Hacc in Hnone. discriminate.
+      * destruct Haccepted as [_ [Hsent Hacks]].
+        split; [exact Hacks |].
+        split; [exact (Hleaderacks p) | exact Hsent].
+    + split.
+      * intros _. specialize (Haccepted leader).
+        destruct (excluded_middle_informative
+          (leader < n /\ is_proposer leader)).
+        -- exfalso. destruct a as [_ Hprop].
+           exact (sp_leader_not_proposer Hprop).
+        -- tauto.
+      * split.
+        -- intros owner v src Hacc Hin.
+           specialize (Haccepted owner).
+           destruct (excluded_middle_informative
+             (owner < n /\ is_proposer owner)).
+           ++ destruct Haccepted as [Howner [Hsent Hacks]].
+              rewrite Howner in Hacc. injection Hacc as ->.
+              rewrite Hacks in Hin. simpl in Hin.
+              destruct Hin as [-> | []]. exact Hsent.
+           ++ destruct Haccepted as [Howner _].
+              rewrite Howner in Hacc. discriminate.
+        -- split.
+           ++ intros owner v src Hacc Hin.
+              rewrite (Hleaderacks owner) in Hin. contradiction.
+           ++ intros src dst.
+              destruct Hnetwork as [Hpropnet Hemptynet].
+              destruct (classic
+                (src < n /\ dst < n /\ src <> dst /\ is_proposer src))
+                as [[Hs [Hd [Hneq Hp]]] | Hnone].
+              ** rewrite (Hpropnet src dst Hs Hd Hneq Hp).
+                 constructor; simpl; constructor.
+              ** rewrite (Hemptynet src dst Hnone). constructor.
+  - unfold sp_evidence_invariant in IH.
+    destruct IH as
+      [Hnone [Hleaderempty [Hord [Hlead Hnet]]]].
+    unfold step, sp_instance in Hstep; simpl in Hstep.
+    destruct Hstep as [[Hneq [Hqsrc Hrecv]] Hstep].
+    destruct (network s qsrc recv) as [|m rest] eqn:Hqueue.
+    + unfold state_eq in Hstep. destruct Hstep as [Hlocal Hnetwork].
+      unfold sp_evidence_invariant.
+      split.
+      * intros p Hp. rewrite Hlocal in Hp. rewrite Hlocal.
+        exact (Hnone p Hp).
+      * split.
+        -- intros Hl. rewrite Hlocal in Hl. rewrite Hlocal.
+           exact (Hleaderempty Hl).
+        -- split.
+           ++ intros owner v src Hacc Hin.
+              rewrite Hlocal in Hacc, Hin. rewrite Hlocal.
+              exact (Hord owner v src Hacc Hin).
+           ++ split.
+              ** intros owner v src Hacc Hin.
+                 rewrite Hlocal in Hacc, Hin. rewrite Hlocal.
+                 exact (Hlead owner v src Hacc Hin).
+              ** intros src dst. rewrite Hnetwork.
+                 eapply Forall_impl.
+                 2: exact (Hnet src dst).
+                 intros x Hx. unfold sp_evidence_msg_ok in *.
+                 destruct x as [v | v | a v kind]; auto.
+                 destruct kind; destruct Hx as [-> Hx]; split; auto;
+                   rewrite Hlocal; exact Hx.
+    + destruct Hstep as
+        [[Hstate Hothers] [Hconsume [Hsend Hunchanged]]].
+      pose proof (Hnet qsrc recv) as Hhead.
+      rewrite Hqueue in Hhead. apply Forall_inv in Hhead.
+      assert (Hsent_preserved :
+        forall p v,
+          sp_sent_ordinary (local s p) = Some v ->
+          sp_sent_ordinary (local s' p) = Some v).
+      { intros p v Hsent.
+        destruct (classic (p = recv)) as [-> | Hp].
+        - rewrite Hstate.
+          exact (sp_sent_ordinary_stable
+                   recv (local s recv) m v Hsent).
+        - rewrite (Hothers p Hp). exact Hsent. }
+      assert (Hchoice_preserved :
+        forall p v,
+          sp_leader_choice (local s p) = Some v ->
+          sp_leader_choice (local s' p) = Some v).
+      { intros p v Hchoice.
+        destruct (classic (p = recv)) as [-> | Hp].
+        - rewrite Hstate.
+          destruct (sp_local_choice_monotone recv (local s recv) m)
+            as [Hnonechoice | Hsame].
+          + rewrite Hnonechoice in Hchoice. discriminate.
+          + rewrite Hsame. exact Hchoice.
+        - rewrite (Hothers p Hp). exact Hchoice. }
+      unfold sp_evidence_invariant.
+      split.
+      * intros p Haccnone.
+        destruct (classic (p = recv)) as [-> | Hp].
+        -- rewrite Hstate in Haccnone.
+           unfold sp_step_fn in Haccnone.
+           destruct (sp_output (local s recv)) eqn:Hout; simpl in Haccnone.
+           ++ rewrite Hstate. unfold sp_step_fn. rewrite Hout. simpl.
+              exact (Hnone recv Haccnone).
+           ++ destruct m as [v | v | src v kind].
+              ** destruct (recv =? leader) eqn:Hrl; simpl in Haccnone.
+                 --- destruct (sp_leader_choice (local s recv)) eqn:Hlc;
+                       simpl in Haccnone.
+                     +++ rewrite Hstate. unfold sp_step_fn.
+                         rewrite Hout. simpl. rewrite Hrl, Hlc. simpl.
+                         exact (Hnone recv Haccnone).
+                     +++ congruence.
+                 --- destruct (sp_accepted (local s recv)) eqn:Hacc;
+                       simpl in Haccnone; congruence.
+              ** destruct (recv =? leader) eqn:Hrl; simpl in Haccnone.
+                 --- rewrite Hstate. unfold sp_step_fn.
+                     rewrite Hout. simpl. rewrite Hrl. simpl.
+                     exact (Hnone recv Haccnone).
+                 --- destruct (sp_leader_choice (local s recv)) eqn:Hlc;
+                       simpl in Haccnone.
+                     +++ rewrite Hstate. unfold sp_step_fn.
+                         rewrite Hout. simpl. rewrite Hrl, Hlc. simpl.
+                         exact (Hnone recv Haccnone).
+                     +++ discriminate.
+               ** destruct (sp_accepted (local s recv)) eqn:Hacc.
+                 --- destruct (v =? p); simpl in Haccnone.
+                     +++ destruct kind; simpl in Haccnone; try discriminate.
+                     +++ congruence.
+                 --- rewrite Hstate. unfold sp_step_fn.
+                     rewrite Hout. simpl. rewrite Hacc. simpl.
+                     exact (Hnone recv Haccnone).
+        -- rewrite (Hothers p Hp) in Haccnone.
+           rewrite (Hothers p Hp). exact (Hnone p Haccnone).
+      * split.
+        -- intros Hlc.
+           destruct (classic (leader = recv)) as [Heq | Hlr].
+           ++ subst recv. rewrite Hstate in Hlc.
+              assert (Holdchoice :
+                sp_leader_choice (local s leader) = None).
+              { destruct (sp_local_choice_monotone
+                  leader (local s leader) m) as [Hnonec | Hsame].
+                - exact Hnonec.
+                - rewrite Hsame in Hlc. exact Hlc. }
+              rewrite Hstate.
+              eapply sp_leader_empty_vote_preserved.
+              ** exact Holdchoice.
+              ** exact (Hleaderempty Holdchoice).
+              ** exact Hlc.
+           ++ rewrite (Hothers leader Hlr) in Hlc.
+              rewrite (Hothers leader Hlr). exact (Hleaderempty Hlc).
+        -- split.
+           ++ intros owner v src Hacc Hin.
+              destruct (classic (owner = recv)) as [-> | Howner].
+              ** rewrite Hstate in Hacc, Hin.
+                 unfold sp_step_fn in Hacc, Hin.
+                 destruct (sp_output (local s recv)) eqn:Hout; simpl in *.
+                 --- eapply Hsent_preserved. eapply Hord; eauto.
+                 --- destruct m as [x | x | acksrc x kind].
+                     +++ destruct (recv =? leader); simpl in *.
+                         *** destruct (sp_leader_choice (local s recv));
+                               simpl in *.
+                             ---- eapply Hsent_preserved.
+                                  eapply Hord; eauto.
+                             ---- contradiction.
+                         *** destruct (sp_accepted (local s recv)); simpl in *.
+                             ---- eapply Hsent_preserved.
+                                  eapply Hord; eauto.
+                             ---- contradiction.
+                     +++ destruct (recv =? leader); simpl in *.
+                         *** eapply Hsent_preserved. eapply Hord; eauto.
+                         *** destruct (sp_leader_choice (local s recv));
+                               simpl in *.
+                             ---- eapply Hsent_preserved.
+                                  eapply Hord; eauto.
+                             ---- contradiction.
+                     +++ destruct (sp_accepted (local s recv))
+                           as [p|] eqn:Haccepted.
+                         *** simpl in *.
+                             destruct (x =? p) eqn:Hx; simpl in *.
+                             ---- destruct kind; simpl in *.
+                                  ++++ apply sp_add_in in Hin as [Heq | Hin].
+                                       **** subst src.
+                                            destruct Hhead as
+                                              [Hacksrc Hevidence].
+                                            subst acksrc.
+                                            pose proof (Hsent_preserved
+                                              qsrc x Hevidence) as Hpres.
+                                            apply Nat.eqb_eq in Hx.
+                                            congruence.
+                                       **** eapply Hsent_preserved.
+                                            eapply Hord;
+                                              [exact (eq_trans Haccepted Hacc)
+                                              | exact Hin].
+                                  ++++ eapply Hsent_preserved.
+                                       eapply Hord;
+                                         [exact (eq_trans Haccepted Hacc)
+                                         | exact Hin].
+                             ---- eapply Hsent_preserved.
+                                  eapply Hord;
+                                    [exact Hacc
+                                    | exact Hin].
+                         *** simpl in Hacc. congruence.
+              ** rewrite (Hothers owner Howner) in Hacc, Hin.
+                 eapply Hsent_preserved.
+                 eapply Hord; [exact Hacc | exact Hin].
+           ++ split.
+              ** intros owner v src Hacc Hin.
+                 destruct (classic (owner = recv)) as [-> | Howner].
+                 --- rewrite Hstate in Hacc, Hin.
+                     unfold sp_step_fn in Hacc, Hin.
+                     destruct (sp_output (local s recv)) eqn:Hout; simpl in *.
+                     +++ eapply Hchoice_preserved. eapply Hlead; eauto.
+                     +++ destruct m as [x | x | acksrc x kind].
+                         *** destruct (recv =? leader); simpl in *.
+                             ---- destruct (sp_leader_choice (local s recv));
+                                  simpl in *.
+                                  ++++ eapply Hchoice_preserved.
+                                       eapply Hlead; eauto.
+                                  ++++ contradiction.
+                             ---- destruct (sp_accepted (local s recv));
+                                  simpl in *.
+                                  ++++ eapply Hchoice_preserved.
+                                       eapply Hlead; eauto.
+                                  ++++ contradiction.
+                         *** destruct (recv =? leader); simpl in *.
+                             ---- eapply Hchoice_preserved.
+                                  eapply Hlead; eauto.
+                             ---- destruct (sp_leader_choice (local s recv));
+                                  simpl in *.
+                                  ++++ eapply Hchoice_preserved.
+                                       eapply Hlead; eauto.
+                                  ++++ contradiction.
+                         *** destruct (sp_accepted (local s recv))
+                               as [p|] eqn:Haccepted.
+                             ---- simpl in *.
+                                  destruct (x =? p) eqn:Hx; simpl in *.
+                                  ++++ destruct kind; simpl in *.
+                                       **** eapply Hchoice_preserved.
+                                            eapply Hlead;
+                                              [exact (eq_trans Haccepted Hacc)
+                                              | exact Hin].
+                                       **** apply sp_add_in in Hin
+                                              as [Heq | Hin].
+                                            { subst src.
+                                              destruct Hhead as
+                                                [Hacksrc Hevidence].
+                                              subst acksrc.
+                                              pose proof
+                                                (Hchoice_preserved
+                                                  qsrc x Hevidence) as Hpres.
+                                              apply Nat.eqb_eq in Hx.
+                                              congruence. }
+                                            { eapply Hchoice_preserved.
+                                              eapply Hlead;
+                                                [exact
+                                                  (eq_trans Haccepted Hacc)
+                                                | exact Hin]. }
+                                  ++++ eapply Hchoice_preserved.
+                                       eapply Hlead;
+                                         [exact Hacc | exact Hin].
+                             ---- simpl in Hacc. congruence.
+                  --- rewrite (Hothers owner Howner) in Hacc, Hin.
+                     eapply Hchoice_preserved.
+                     eapply Hlead; [exact Hacc | exact Hin].
+              ** intros src dst.
+                 destruct (classic (src = recv)) as [-> | Hsrcneq].
+                 --- rewrite Hsend. apply Forall_app. split.
+                     +++ eapply Forall_impl.
+                         2: exact (Hnet recv dst).
+                         intros x Hx.
+                          unfold sp_evidence_msg_ok in *.
+                          destruct x as [x | x | a x kind]; auto.
+                          destruct kind.
+                          { destruct Hx as [-> Hx]. split; [reflexivity |].
+                            exact (Hsent_preserved recv x Hx). }
+                          { destruct Hx as [-> Hx]. split; [reflexivity |].
+                            exact (Hchoice_preserved recv x Hx). }
+                     +++ unfold sp_step_fn.
+                         destruct (sp_output (local s recv)) eqn:Houtput;
+                           simpl.
+                         { constructor. }
+                         destruct m as [x | x | a x kind].
+                         *** destruct (recv =? leader) eqn:Hrl; simpl.
+                             ---- destruct (sp_leader_choice (local s recv))
+                                    eqn:Hchoice;
+                                  simpl; [constructor |].
+                                   destruct (dst =? x); simpl;
+                                     repeat constructor; simpl; auto.
+                                   { apply Nat.eqb_eq in Hrl.
+                                     symmetry. exact Hrl. }
+                                   { apply Nat.eqb_eq in Hrl. subst recv.
+                                     rewrite Hstate. unfold sp_step_fn. simpl.
+                                     rewrite Houtput, Nat.eqb_refl, Hchoice.
+                                     simpl.
+                                     unfold sp_record_choice.
+                                     rewrite (Hleaderempty Hchoice).
+                                     reflexivity. }
+                             ---- destruct (sp_accepted (local s recv)) eqn:Hacc;
+                                  simpl; [constructor |].
+                                  destruct (dst =? x); simpl; [|constructor].
+                                   constructor; [|constructor]. simpl.
+                                   split; [reflexivity |].
+                                   rewrite Hstate. unfold sp_step_fn.
+                                   rewrite Houtput. simpl. rewrite Hrl, Hacc.
+                                   simpl. unfold sp_record_choice.
+                                   rewrite (proj2 (proj2 (Hnone recv Hacc))).
+                                   reflexivity.
+                         *** destruct (recv =? leader) eqn:Hrl;
+                               simpl; [constructor |].
+                             destruct (sp_leader_choice (local s recv))
+                               eqn:Hchoice;
+                               simpl; [constructor |].
+                             destruct (dst =? x); simpl; [|constructor].
+                             constructor; [|constructor]. simpl.
+                             split; [reflexivity |].
+                             rewrite Hstate. unfold sp_step_fn.
+                             rewrite Houtput. simpl. rewrite Hrl, Hchoice.
+                             reflexivity.
+                         *** destruct (sp_accepted (local s recv));
+                               simpl; [|constructor].
+                             destruct (x =? p); simpl; constructor.
+                 --- destruct (classic (dst = recv)) as [-> | Hdstneq].
+                     +++ destruct (classic (src = qsrc)) as [-> | Hsrcq].
+                          *** rewrite Hconsume.
+                              pose proof (Hnet qsrc recv) as Hold.
+                              rewrite Hqueue in Hold.
+                              eapply Forall_impl.
+                              2: exact (Forall_inv_tail Hold).
+                              intros msg Hmsg.
+                              eapply sp_evidence_msg_preserved; eauto.
+                          *** rewrite Hunchanged; auto.
+                              eapply Forall_impl.
+                              2: exact (Hnet src recv).
+                              intros msg Hmsg.
+                              eapply sp_evidence_msg_preserved; eauto.
+                      +++ rewrite Hunchanged; auto.
+                          eapply Forall_impl.
+                          2: exact (Hnet src dst).
+                          intros msg Hmsg.
+                          eapply sp_evidence_msg_preserved; eauto.
+Qed.
+
+Definition sp_node_records (s : SP_GlobalState)
+    (p v : ProcessId) : Prop :=
+  sp_sent_ordinary (local s p) = Some v \/
+  sp_leader_choice (local s p) = Some v.
+
+Lemma sp_C1_quorum_large :
+  forall Q,
+    sp_C1_fast_quorum Q ->
+    f + 1 <= length Q.
+Proof.
+  intros Q [_ [_ [_ Hsize]]].
+  rewrite sp_n_eq in Hsize. lia.
+Qed.
+
+Lemma sp_commit_certificate :
+  forall s,
+    SP_Reachable s ->
+    forall owner v,
+      sp_output (local s owner) = Some (Commit v) ->
+      exists cert,
+        NoDup cert /\
+        (forall p, In p cert -> p < n) /\
+        f + 1 <= length cert /\
+        (forall p, In p cert -> sp_node_records s p v).
+Proof.
+  intros s Hreach owner v Hout.
+  destruct (sp_output_facts s Hreach owner (Commit v) Hout)
+    as [w [Heq [_ [Haccepted [_ Hcert]]]]].
+  injection Heq as ->.
+  destruct (sp_evidence_invariant_reachable s Hreach)
+    as [_ [_ [Hord [Hlead _]]]].
+  destruct Hcert as [Hdirect | Hleadercert].
+  - destruct Hdirect as [Q [HQ Hincl]].
+    exists Q.
+    unfold sp_direct_fast_quorum in HQ.
+    destruct config.
+    + simpl in HQ.
+      destruct HQ as [Hnd [Hvalid [Hleader Hsize]]].
+      repeat split; auto.
+      * apply sp_C1_quorum_large.
+        repeat split; auto.
+      * intros p Hp. left.
+        eapply Hord; [exact Haccepted |].
+        exact (Hincl p Hp).
+    + simpl in HQ.
+      unfold sp_C2_fast_quorum in HQ.
+      subst Q. split; [exact sp_c2_nodup |].
+      split; [exact sp_c2_valid |].
+      split.
+      * rewrite <- sp_c2_size. apply Nat.le_refl.
+      * intros p Hp. left.
+        eapply Hord; [exact Haccepted |].
+        exact (Hincl p Hp).
+  - exists (sp_leader_acks (local s owner)).
+    destruct Hleadercert as [Hnd [Hvalid Hsize]].
+    repeat split; auto.
+    intros p Hp. right.
+    eapply Hlead; eauto.
+Qed.
+
+Definition sp_intersection (A B : list ProcessId) : list ProcessId :=
+  filter (fun x => existsb (Nat.eqb x) B) A.
+
+Lemma sp_intersection_spec :
+  forall x A B,
+    In x (sp_intersection A B) <-> In x A /\ In x B.
+Proof.
+  intros x A B. unfold sp_intersection.
+  rewrite filter_In. split.
+  - intros [HxA Htest]. split; [exact HxA |].
+    apply existsb_exists in Htest as [y [Hy Heq]].
+    apply Nat.eqb_eq in Heq. subst y. exact Hy.
+  - intros [HxA HxB]. split; [exact HxA |].
+    apply existsb_exists. exists x.
+    split; [exact HxB | apply Nat.eqb_refl].
+Qed.
+
+Lemma sp_intersection_length_lower_bound :
+  forall A B : list ProcessId,
+    NoDup A -> (forall x, In x A -> x < n) ->
+    NoDup B -> (forall x, In x B -> x < n) ->
+    length A + length B <= n + length (sp_intersection A B).
+Proof.
+  intros A B HndA HvalA HndB HvalB.
+  set (inside := fun x => existsb (Nat.eqb x) B).
+  set (D := filter (fun x => negb (inside x)) A).
+  assert (Hpartition : length (filter inside A) + length D = length A).
+  { unfold D. exact (filter_length inside A). }
+  assert (HndD : NoDup D) by (apply NoDup_filter; exact HndA).
+  assert (HinclD :
+    incl D (filter (fun x => negb (inside x)) (seq 0 n))).
+  { intros x Hx. apply filter_In in Hx as [HxA Hnot].
     apply filter_In. split.
-    - apply in_seq. split; [lia | exact (Hval_A x HxA)].
-    - exact HxnB. }
-  assert (Hlen_D : length D <= length (filter (fun x => negb (f_in x)) (seq 0 m)))
-    by exact (NoDup_incl_length Hnd_D Hincl_D).
-  assert (Hseq_B : length (filter f_in (seq 0 m)) = length B).
+    - apply in_seq. split; [lia | exact (HvalA x HxA)].
+    - exact Hnot. }
+  assert (HlenD :
+    length D <= length (filter (fun x => negb (inside x)) (seq 0 n)))
+    by exact (NoDup_incl_length HndD HinclD).
+  assert (Hinside_seq : length (filter inside (seq 0 n)) = length B).
   { apply Nat.le_antisymm.
     - apply NoDup_incl_length; [apply NoDup_filter, seq_NoDup |].
-      intros x Hx. apply filter_In in Hx as [_ HxB].
-      unfold f_in in HxB. apply existsb_exists in HxB as [y [HyB Heq]].
-      apply Nat.eqb_eq in Heq. subst y. exact HyB.
-    - apply NoDup_incl_length; [exact Hnd_B |].
-      intros b Hb. apply filter_In. split.
-      + apply in_seq. split; [lia | exact (Hval_B b Hb)].
-      + unfold f_in. apply existsb_exists. exists b. split; [exact Hb | apply Nat.eqb_refl]. }
-  pose proof (filter_length f_in (seq 0 m)) as H_seq_part.
-  rewrite length_seq, Hseq_B in H_seq_part.
+      intros x Hx. apply filter_In in Hx as [_ Htest].
+      unfold inside in Htest.
+      apply existsb_exists in Htest as [y [Hy Heq]].
+      apply Nat.eqb_eq in Heq. subst y. exact Hy.
+    - apply NoDup_incl_length; [exact HndB |].
+      intros x Hx. apply filter_In. split.
+      + apply in_seq. split; [lia | exact (HvalB x Hx)].
+      + unfold inside. apply existsb_exists.
+        exists x. split; [exact Hx | apply Nat.eqb_refl]. }
+  pose proof (filter_length inside (seq 0 n)) as Hseqpartition.
+  rewrite length_seq, Hinside_seq in Hseqpartition.
+  change (length A + length B <= n + length (filter inside A)).
   lia.
+Qed.
+
+(** Arithmetic audit for [f=1,2,3,4], hence [n=3,5,7,9]:
+    the minimum C1 sizes are [3,4,6,7], and pairwise intersection
+    lower bounds are [3,3,5,5], all strictly larger than [f]. *)
+Lemma sp_C1_intersection_large :
+  forall A B,
+    sp_C1_fast_quorum A ->
+    sp_C1_fast_quorum B ->
+    f < length (sp_intersection A B).
+Proof.
+  intros A B [HndA [HvalA [_ HsizeA]]]
+             [HndB [HvalB [_ HsizeB]]].
+  pose proof (sp_intersection_length_lower_bound
+    A B HndA HvalA HndB HvalB) as Hinter.
+  rewrite sp_n_eq in HsizeA, HsizeB, Hinter.
+  lia.
+Qed.
+
+Lemma sp_large_sets_intersect :
+  forall A B,
+    NoDup A -> (forall x, In x A -> x < n) ->
+    NoDup B -> (forall x, In x B -> x < n) ->
+    n < length A + length B ->
+    exists x, In x A /\ In x B.
+Proof.
+  intros A B HndA HvalA HndB HvalB Hlarge.
+  apply Classical_Pred_Type.not_all_not_ex.
+  intro Hnone.
+  assert (Hdisj : forall x, In x A -> ~ In x B).
+  { intros x HxA HxB. exact (Hnone x (conj HxA HxB)). }
+  assert (Hnd : NoDup (A ++ B)).
+  { apply NoDup_app; auto. }
+  assert (Hincl : incl (A ++ B) (seq 0 n)).
+  { intros x Hx. apply in_app_iff in Hx. apply in_seq.
+    split; [lia |].
+    destruct Hx as [Hx | Hx];
+      [exact (HvalA x Hx) | exact (HvalB x Hx)]. }
+  pose proof (NoDup_incl_length Hnd Hincl) as Hbound.
+  rewrite length_app, length_seq in Hbound. lia.
+Qed.
+
+Lemma sp_direct_quorums_common_alive :
+  forall A B alive,
+    sp_direct_fast_quorum A ->
+    sp_direct_fast_quorum B ->
+    NoDup alive ->
+    n - f <= length alive ->
+    (forall x, In x alive -> x < n) ->
+    exists x, In x A /\ In x B /\ In x alive.
+Proof.
+  intros A B alive HA HB Hndalive Hlenalive Hvalalive.
+  unfold sp_direct_fast_quorum in HA, HB.
+  destruct config.
+  - simpl in HA, HB.
+    set (I := sp_intersection A B).
+    assert (HndI : NoDup I).
+    { unfold I, sp_intersection. apply NoDup_filter.
+      exact (proj1 HA). }
+    assert (HvalI : forall x, In x I -> x < n).
+    { intros x Hx. apply sp_intersection_spec in Hx as [HxA _].
+      exact (proj1 (proj2 HA) x HxA). }
+    assert (HlenI : f < length I).
+    { unfold I. exact (sp_C1_intersection_large A B HA HB). }
+    assert (Hlarge : n < length I + length alive).
+    { rewrite sp_n_eq in Hlenalive |- *. lia. }
+    destruct (sp_large_sets_intersect
+      I alive HndI HvalI Hndalive Hvalalive Hlarge)
+      as [x [HxI Hxalive]].
+    apply sp_intersection_spec in HxI as [HxA HxB].
+    exists x. auto.
+  - simpl in HA, HB.
+    unfold sp_C2_fast_quorum in HA, HB. subst A. subst B.
+    assert (Hlarge : n < length c2_quorum + length alive).
+    { rewrite sp_n_eq in Hlenalive |- *.
+      rewrite sp_c2_size. lia. }
+    destruct (sp_large_sets_intersect c2_quorum alive
+      sp_c2_nodup sp_c2_valid Hndalive Hvalalive Hlarge)
+      as [x [HxQ Hxalive]].
+    exists x. auto.
+Qed.
+
+Lemma sp_leader_certificate_has_alive :
+  forall cert alive,
+    sp_leader_certificate cert ->
+    NoDup alive ->
+    n - f <= length alive ->
+    (forall x, In x alive -> x < n) ->
+    exists x, In x cert /\ In x alive.
+Proof.
+  intros cert alive [Hndcert [Hvalcert Hlencert]]
+    Hndalive Hlenalive Hvalalive.
+  assert (Hlarge : n < length cert + length alive).
+  { rewrite sp_n_eq in Hlenalive |- *. lia. }
+  exact (sp_large_sets_intersect cert alive
+    Hndcert Hvalcert Hndalive Hvalalive Hlarge).
 Qed.
 
 Theorem SwiftPaxos_Recoverability : Recoverability n f sp_instance.
 Proof.
-  unfold Recoverability, sp_instance, output_of, valid_pid, acp_proc_output; simpl.
-  intros s s' alive v w Hs Hs' Hnd_alive Hlen_alive Hval_alive Hlocal_eq [p Hp] [q Hq].
-  pose proof (sp_commit_pid_valid s Hs p v Hp) as p_valid.
-  pose proof (sp_commit_pid_valid s' Hs' q w Hq) as q_valid.
-  pose proof (commit_implies_accepted s Hs p v p_valid Hp) as Hacc_p.
-  pose proof (commit_implies_quorum s Hs p v p_valid Hp) as Hquorum_p.
-  pose proof (nodup_in_acceptors s Hs p p_valid) as Hnd_Ap.
-  pose proof (fun r Hr => all_acceptors_are_valid s Hs p p_valid r Hr) as Hval_Ap.
-  pose proof (fun r Hr => all_acceptors_have_accepted s Hs p v p_valid Hacc_p r Hr) as Hacc_Ap.
-  pose proof (commit_implies_accepted s' Hs' q w q_valid Hq) as Hacc_q.
-  pose proof (commit_implies_quorum s' Hs' q w q_valid Hq) as Hquorum_q.
-  pose proof (nodup_in_acceptors s' Hs' q q_valid) as Hnd_Aq.
-  pose proof (fun r Hr => all_acceptors_are_valid s' Hs' q q_valid r Hr) as Hval_Aq.
-  pose proof (fun r Hr => all_acceptors_have_accepted s' Hs' q w q_valid Hacc_q r Hr) as Hacc_Aq.
-  (* B = alive processes that are in q's acceptor list in s' *)
-  set (B := filter (fun r => existsb (Nat.eqb r) alive) (sp_acceptors (local s' q))).
-  assert (Hnd_B : NoDup B) by (apply NoDup_filter; exact Hnd_Aq).
-  assert (Hval_B : forall r, In r B -> r < n).
-  { intros r Hr. apply filter_In in Hr as [Hr _]. exact (Hval_Aq r Hr). }
-  (* Every r in B has sp_accepted(s, r) = Some w *)
-  assert (Hacc_B : forall r, In r B -> sp_accepted (local s r) = Some w).
-  { intros r Hr.
-    apply filter_In in Hr as [HrAq Hr_alive].
-    apply existsb_exists in Hr_alive as [r' [Hr'alive Heq]].
-    apply Nat.eqb_eq in Heq. subst r'.
-    rewrite (Hlocal_eq r Hr'alive). exact (Hacc_Aq r HrAq). }
-  (* |A_q(s')| + |alive| <= n + |B|, so |B| is large *)
-  pose proof (filter_inter_lb (sp_acceptors (local s' q)) alive n
-                Hnd_Aq Hval_Aq Hnd_alive Hval_alive) as Hlen_B.
-  fold B in Hlen_B.
-  (* n < |A_p(s)| + |B| by arithmetic on quorum sizes *)
-  assert (Hsum : n < length (sp_acceptors (local s p)) + length B).
-  { unfold sp_quorum in *.
-    rewrite n_eq_2f_plus_1 in *.
-    pose proof (Nat.div_mod (f + 1) 2 ltac:(lia)) as Hdiv.
-    pose proof (Nat.mod_upper_bound (f + 1) 2 ltac:(lia)) as Hmod.
-    lia. }
-  (* Get witness r in A_p(s) inter B *)
-  destruct (list_intersection (sp_acceptors (local s p)) B n
-              Hnd_Ap Hval_Ap Hnd_B Hval_B Hsum) as [r [HrAp HrB]].
-  pose proof (Hacc_Ap r HrAp) as Hrv.
-  pose proof (Hacc_B r HrB) as Hrw.
-  congruence.
+  unfold Recoverability, sp_instance, output_of, valid_pid; simpl.
+  intros s s' alive v w Hs Hs' Hndalive Hlenalive Hvalalive Hequal
+    [owner Hout] [owner' Hout'].
+  destruct (sp_output_facts s Hs owner (Commit v) Hout)
+    as [v0 [Hv0 [_ [Haccv [Hchoicev Hcertv]]]]].
+  injection Hv0 as Heqv. subst v0.
+  destruct (sp_output_facts s' Hs' owner' (Commit w) Hout')
+    as [w0 [Hw0 [_ [Haccw [Hchoicew Hcertw]]]]].
+  injection Hw0 as Heqw. subst w0.
+  destruct (sp_evidence_invariant_reachable s Hs)
+    as [_ [_ [Hordv [Hleadv _]]]].
+  destruct (sp_evidence_invariant_reachable s' Hs')
+    as [_ [_ [Hordw [Hleadw _]]]].
+  destruct (sp_choice_invariant_reachable s Hs)
+    as [Hanchorv _].
+  destruct (sp_choice_invariant_reachable s' Hs')
+    as [Hanchorw _].
+  destruct Hcertv as [Hdirectv | Hleadcertv];
+    destruct Hcertw as [Hdirectw | Hleadcertw].
+  - destruct Hdirectv as [A [HA HinclA]].
+    destruct Hdirectw as [B [HB HinclB]].
+    destruct (sp_direct_quorums_common_alive A B alive
+      HA HB Hndalive Hlenalive Hvalalive)
+      as [x [HxA [HxB Hxalive]]].
+    pose proof (Hordv owner v x Haccv (HinclA x HxA)) as Hxv.
+    pose proof (Hordw owner' w x Haccw (HinclB x HxB)) as Hxw.
+    rewrite (Hequal x Hxalive) in Hxv. congruence.
+  - destruct (sp_leader_certificate_has_alive
+      (sp_leader_acks (local s' owner')) alive
+      Hleadcertw Hndalive Hlenalive Hvalalive)
+      as [x [Hxcert Hxalive]].
+    pose proof (Hleadw owner' w x Haccw Hxcert) as Hxw.
+    assert (Hxw_s : sp_leader_choice (local s x) = Some w).
+    { rewrite (Hequal x Hxalive). exact Hxw. }
+    pose proof (Hanchorv owner v Hchoicev) as Hvleader.
+    pose proof (Hanchorv x w Hxw_s) as Hwleader.
+    congruence.
+  - destruct (sp_leader_certificate_has_alive
+      (sp_leader_acks (local s owner)) alive
+      Hleadcertv Hndalive Hlenalive Hvalalive)
+      as [x [Hxcert Hxalive]].
+    pose proof (Hleadv owner v x Haccv Hxcert) as Hxv.
+    assert (Hxv_s' : sp_leader_choice (local s' x) = Some v).
+    { rewrite <- (Hequal x Hxalive). exact Hxv. }
+    pose proof (Hanchorw x v Hxv_s') as Hvleader.
+    pose proof (Hanchorw owner' w Hchoicew) as Hwleader.
+    congruence.
+  - destruct (sp_leader_certificate_has_alive
+      (sp_leader_acks (local s owner)) alive
+      Hleadcertv Hndalive Hlenalive Hvalalive)
+      as [x [Hxcert Hxalive]].
+    pose proof (Hleadv owner v x Haccv Hxcert) as Hxv.
+    assert (Hxv_s' : sp_leader_choice (local s' x) = Some v).
+    { rewrite <- (Hequal x Hxalive). exact Hxv. }
+    pose proof (Hanchorw x v Hxv_s') as Hvleader.
+    pose proof (Hanchorw owner' w Hchoicew) as Hwleader.
+    congruence.
 Qed.
 
 End SP.

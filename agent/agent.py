@@ -31,6 +31,8 @@ Unlike FastPaxos, only command leader v may output Commit v; other replicas may 
 
     ep_output (local s p) = Some (Commit v) -> p = v
 
+Also prove the protocol-specific invariant: command leader p never acknowledges a different value v <> p. In this model, leader p starts accepted on p and accepted values are stable, so p cannot appear in the commit certificate for v.
+
 For EPaxos Recoverability, absolutely do not follow the Recoverability proof strategy in `FastPaxos.v`; that fast-quorum/live-quorum intersection argument is false for the optimized quorum.
 
 In particular, DO NOT define
@@ -51,45 +53,77 @@ Instead count non-alive nodes: if different values v and w are committed in two 
 
 With `n = 2 * f + 1` and `ep_quorum = f + floor((f + 1) / 2)`, this is `2 * floor((f + 1) / 2) + 1 > f`, contradicting that at most f nodes are non-alive.
 
-When implementing Recoverability, first prove helper lemmas for:
-1. all replicas in Av ∩ Aw are non-alive;
+Before proving `EPaxos_Recoverability`, first prove the required counting facts as separate lemmas.
+
+The proof must count the full non-alive witness list, not only the quorum intersection. Concretely, define a list representing `Av ∩ Aw`, then define the full witness list consisting of:
+
+```
+leader v, leader w, and Av ∩ Aw
+```
+
+The contradiction must come from the full witness list having more than f distinct non-alive valid processes. It must not come from proving:
+
+```
+|Av ∩ Aw| > f
+```
+
+because that statement is false for small valid cases such as f = 2.
+
+For the full witness list, prove separately:
+
+1. every node in `Av ∩ Aw` is non-alive;
 2. leader v is non-alive;
 3. leader w is non-alive;
-4. these three groups are disjoint;
-5. together they imply more than f non-alive nodes.
+4. the full witness list is NoDup;
+5. every element of the full witness list is a valid process id;
+6. every element of the full witness list is not alive;
+7. the full witness list has length greater than f;
+8. the full witness list is disjoint from alive, so the finite-domain length bound gives the contradiction.
 
-Do not attempt to repair any proof obligation of the form `n < length Av + length (Aw ∩ alive)`; delete that route instead.
+Do not attempt to repair any proof obligation of the form:
+
+```
+n < length Av + length (Aw ∩ alive)
+```
+
+If such an obligation appears, or if a small-case check shows the inequality can be tight or false, delete the entire proof route immediately. Do not case-split on the tight case, and do not leave an admitted boundary case.
 """,
 
     "SwiftPaxos": r"""
 ## SwiftPaxos mandatory override
 
-Do not model SwiftPaxos as renamed Fast Paxos.
-
 The model must include a distinguished leader.
 
-Every direct fast quorum used for fast commit must include the leader.
+This task must explicitly consider both SwiftPaxos fast-quorum configurations from the paper:
+
+* C1: a direct fast quorum is any duplicate-free set of valid processes that contains the leader and satisfies the SwiftPaxos C1 size condition, i.e. `4 * length Q > 3 * n`.
+* C2: a direct fast quorum is one predetermined quorum of size `f + 1` that contains the leader.
+
+Do not choose only one of C1 or C2. The file must define both configurations explicitly, for example by defining `SPConfig := C1 | C2`, or by defining separate predicates such as `sp_C1_fast_quorum` and `sp_C2_fast_quorum`.
+
+For the direct fast path, a proposer may fast-commit by receiving ordinary acknowledgements covering a direct fast quorum for the chosen configuration. Therefore:
+
+* under C1, the direct fast quorum must satisfy the C1 predicate;
+* under C2, the direct fast quorum must be the predetermined fixed quorum.
+
+The model must also include the leader-choice fast path, independently of C1/C2:
+
+1. the leader forwards or broadcasts the first proposal it accepts;
+2. a replica receiving the leader-forwarded proposal overrides its tentative accepted value with the leader's value;
+3. the replica records that this value is the leader's accepted choice;
+4. the replica sends a distinct leader-choice acknowledgement;
+5. a proposer may also fast-commit by receiving `f + 1` distinct leader-choice acknowledgements.
 
 The model must distinguish at least two kinds of acknowledgements:
 
 1. ordinary acknowledgement of a proposal;
 2. leader-choice acknowledgement, meaning that the sender knows this value is the one accepted/forwarded by the leader.
 
-The model must include the leader-choice fast path:
+Do not replace SwiftPaxos with a generic FastPaxos-style quorum-intersection proof. The proof strategy should use the SwiftPaxos-specific fact that every direct fast quorum contains the leader, and that leader-choice acknowledgements always name the leader's accepted choice.
 
-1. the leader forwards or broadcasts the first proposal it accepts;
-2. a replica receiving the leader-forwarded proposal overrides its tentative accepted value with the leader's value;
-3. the replica records that this value is the leader's accepted choice;
-4. the replica sends a distinct leader-choice acknowledgement;
-5. a proposer may fast-commit either:
-   - by receiving acknowledgements from a fast quorum that includes the leader; or
-   - by receiving f + 1 leader-choice acknowledgements.
+The fixed-quorum C2 variant may be used only as one of the two explicitly modeled configurations. It must not replace C1.
 
-The second case is still part of the fast path, even though it goes through the leader.
-
-If modeling the fixed-quorum variant of SwiftPaxos, define one predetermined quorum of size f + 1 that includes the leader. In that case, do not also use FastPaxos-sized quorums.
-
-Do not replace the leader-choice path with a generic FastPaxos quorum-intersection proof.
+Before final success, verify that the target file explicitly contains both C1 and C2 definitions or predicates, not only a fixed quorum of size `f + 1`.
 """
 }
 
@@ -120,7 +154,7 @@ Work autonomously. Do not ask for user input, confirmation, or preference at any
 
 This task is NOT to formalize the full protocol from the paper.
 
-The goal is to implement a small adopt-commit instantiation that captures the protocol's fast-path quorum idea and proves the same four high-level framework properties.
+The goal is to implement a small adopt-commit instantiation that captures the protocol's fast-path quorum idea and proves the four high-level framework properties (i.e., Validity, Agreement, Convergence, and Recoverability).
 
 Implement and prove ONLY the fast path.
 
@@ -174,36 +208,34 @@ $(ROCQC) __OUTPUT_FILE__
 
 ## Step 5 — Prove the four properties
 
-Prove the four properties incrementally. Write exactly one new lemma or theorem per edit. Do not append multiple helper lemmas and a theorem in one large edit. After each new lemma or theorem, run `make` before adding the next one.
-```
-__PROTOCOL_NAME___Validity
-__PROTOCOL_NAME___Agreement
-__PROTOCOL_NAME___Convergence
-__PROTOCOL_NAME___Recoverability
-```
-
-These theorems should be interpreted at the adopt-commit abstraction level.
+Prove the following four properties.
+- `__PROTOCOL_NAME___Validity`
+- `__PROTOCOL_NAME___Agreement`
+- `__PROTOCOL_NAME___Convergence`
+- `__PROTOCOL_NAME___Recoverability`
 
 Important:
+1. Write exactly one new lemma or theorem per edit. Do not append multiple helper lemmas and a theorem in one large edit. After each completed lemma or theorem ending with `Qed`, run `make` before adding the next lemma or theorem. This compile is only a local regression check, not task completion. Do not stop after helper lemmas. Continue until all four required theorem names exist in the target file and Step 6 passes.
+2. The framework provides only `f_lt_n : f < n` as its base hypothesis. If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption, for example `n = 2 * f + 1` and `0 < f`, add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
+3. Before proving any arithmetic, quorum, intersection, or counting lemma, explicitly test the statement in comments on f = 1, 2, 3, and 4 using the protocol's quorum formula. If a small-case test shows that a proposed statement can be non-strict, false, or only sometimes true, immediately delete the Coq code for that route. Do not introduce a case split to salvage it. Do not leave an admitted boundary case.
 
-- `__PROTOCOL_NAME___Validity` should show that every output value (Commit or Adopt) was proposed by a valid proposer.
-- `__PROTOCOL_NAME___Agreement` should show that if any process commits v, then every process that produces any output (Commit OR Adopt) must output v.
-- `__PROTOCOL_NAME___Convergence` should use the uniqueness of valid proposer values as in the framework: with a unique proposer, every terminating process must Commit (Adopt is not acceptable).
-- `__PROTOCOL_NAME___Recoverability` captures the precise property defined in `AdoptCommit.v`: for any two reachable states `s` and `s'` that agree on the local states of at least `n - f` processes, if `s` has a `Commit v` and `s'` has a `Commit w`, then `v = w`.
+## Step 6 — Final checks
 
-The framework provides only `f_lt_n : f < n` as its base hypothesis. If the fast quorum formula for `__PROTOCOL_NAME__` requires a stronger assumption, for example `n = 2 * f + 1` and `0 < f`, add it as an explicit `Hypothesis` in your file and justify it with a reference to the paper.
-
-After all four properties are proved, run a final `make` and verify:
+After all four properties are proved, run `make` and verify:
 
 ```bash
+grep -n "Theorem __PROTOCOL_NAME___Validity" __OUTPUT_FILE__
+grep -n "Theorem __PROTOCOL_NAME___Agreement" __OUTPUT_FILE__
+grep -n "Theorem __PROTOCOL_NAME___Convergence" __OUTPUT_FILE__
+grep -n "Theorem __PROTOCOL_NAME___Recoverability" __OUTPUT_FILE__
 grep -rn "Admitted\|admit\b\|^Axiom" __OUTPUT_FILE__
 ```
 
-The grep must print nothing. Do not hide proof failures by weakening the model without justification.
+The first four commands must each print a theorem. The last command must print nothing. If any of these checks fail, the task is not complete. Return to Step 5, fix the missing theorem or proof hole, run `make` again, and repeat Step 6 until all checks pass.
 
 # Phase 4 — Summary
 
-## Step 6 — Final audit report
+## Step 7 — Final audit report
 
 After success, print a concise final report containing:
 
